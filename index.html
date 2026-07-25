@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta name="theme-color" content="#0B1220" />
+    <title>MacrosFit</title>
+    <link rel="icon" type="image/png" href="./icon.png" />
+    <link rel="apple-touch-icon" href="./icon.png" />
+    <link rel="manifest" href="./manifest.json" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <style>
+      * { -webkit-tap-highlight-color: transparent; }
+      html, body, #root { height: 100%; margin: 0; padding: 0; }
+      body { overscroll-behavior: none; background:#0B1220; }
+      #loading { position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+        color:#fff; font-family:'Inter',-apple-system,sans-serif; font-size:14px; opacity:0.7; text-align:center; padding:20px; }
+      #errbox { position:fixed; inset:0; background:#0B1220; color:#fff; padding:20px;
+        font-family:ui-monospace,monospace; font-size:12px; white-space:pre-wrap; overflow:auto; line-height:1.6; display:none; }
+    </style>
+
+    <!-- React y ReactDOM (versión de producción) -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+    <!-- Babel: transforma el JSX de app.jsx directamente en el navegador, sin paso de build -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js" crossorigin></script>
+  </head>
+  <body>
+    <div id="root"><div id="loading">Cargando…</div></div>
+    <pre id="errbox"></pre>
+
+    <script>
+      function showError(title, detail) {
+        var box = document.getElementById("errbox");
+        var root = document.getElementById("root");
+        if (root) root.style.display = "none";
+        if (box) {
+          box.style.display = "block";
+          box.textContent = "⚠️ " + title + "\n\n" + (detail || "");
+        }
+        console.error(title, detail);
+      }
+
+      window.addEventListener("error", function (e) {
+        showError("Error al ejecutar la app", (e && e.message ? e.message : e) + (e && e.filename ? ("\n" + e.filename + ":" + e.lineno + ":" + e.colno) : ""));
+      });
+
+      window.addEventListener("DOMContentLoaded", function () {
+        if (typeof React === "undefined" || typeof ReactDOM === "undefined") {
+          showError("No se pudo cargar React desde el CDN", "Revisa tu conexión a internet y recarga la página.");
+          return;
+        }
+        if (typeof Babel === "undefined") {
+          showError("No se pudo cargar Babel desde el CDN", "Revisa tu conexión a internet y recarga la página.");
+          return;
+        }
+        fetch("./app.jsx?v=2", { cache: "no-store" })
+          .then(function (res) {
+            if (!res.ok) throw new Error("No se pudo cargar app.jsx (HTTP " + res.status + "). Verifica que el archivo esté en la misma carpeta que index.html.");
+            return res.text();
+          })
+          .then(function (code) {
+            var transformed;
+            try {
+              transformed = Babel.transform(code, { presets: [["react", { runtime: "classic" }]], filename: "app.jsx", sourceType: "script" }).code;
+              // Red de seguridad: si por alguna razón queda un import/export
+              // suelto (archivo viejo en caché, copia equivocada, etc.), lo
+              // quitamos para que el script se pueda ejecutar de todas formas.
+              transformed = transformed
+                .replace(/^\s*import\s[^;]*?;?\s*$/gm, "")
+                .replace(/^\s*export\s+default\s+/gm, "")
+                .replace(/^\s*export\s*\{[^}]*\}\s*;?\s*$/gm, "");
+            } catch (compileErr) {
+              showError("Error al compilar app.jsx", compileErr.message);
+              return;
+            }
+            try {
+              var script = document.createElement("script");
+              script.text = transformed;
+              document.body.appendChild(script);
+            } catch (runErr) {
+              showError("Error al ejecutar la app", runErr.message);
+            }
+          })
+          .catch(function (err) {
+            showError("No se pudo cargar app.jsx", err.message);
+          });
+      });
+    </script>
+  </body>
+</html>

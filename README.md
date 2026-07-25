@@ -1,38 +1,41 @@
 # MacrosFit — Compilar el APK desde el celular (sin PC)
 
-Este proyecto ya viene listo para que GitHub compile el APK por ti, en la nube.
-Solo necesitas subir esta carpeta a un repositorio de GitHub.
+Todos los archivos de este proyecto están **sueltos, sin carpetas** (excepto
+`.github/workflows/build.yml`, que GitHub exige que esté en esa ruta exacta).
+Esto es a propósito, para que puedas subirlos desde el navegador del celular
+sin problema. La receta de compilación reconstruye las carpetas que hacen
+falta automáticamente, en la nube.
 
-## Paso a paso (todo desde el navegador del celular)
+## Archivos que debes subir a la raíz del repositorio
 
-1. Entra a **github.com** y crea una cuenta si no tienes una.
-2. Crea un repositorio nuevo (botón "New repository"). Ponle de nombre, por ejemplo, `macrosfit-app`. No importa si es público o privado.
-3. Dentro del repositorio recién creado, busca la opción para **subir archivos** ("Add file" → "Upload files").
-4. Arrastra o selecciona **todo el contenido** de esta carpeta (`macrosfit-capacitor`), incluyendo la carpeta oculta `.github` con el archivo `build.yml` adentro. Asegúrate de que `package.json` quede en la raíz del repositorio (no dentro de otra carpeta).
+- `app.jsx`
+- `index.html`
+- `icon.png`
+- `manifest.json`
+- `package.json`
+- `capacitor.config.json`
+- `.gitignore`
+- `README.md` (este archivo)
 
-   ⚠️ Importante: muchos navegadores de celular ocultan las carpetas que empiezan con un punto (como `.github`) al seleccionar archivos para subir. Si tu navegador no te deja seleccionar esa carpeta, usa la app oficial de GitHub o "Add file → Create new file" y escribe manualmente la ruta `.github/workflows/build.yml`, pegando el contenido de ese archivo.
+Sube estos con "Add file" → "Upload files", seleccionándolos todos juntos.
 
-5. Confirma la subida ("Commit changes"). En cuanto termine, GitHub empieza a compilar solo.
-6. Ve a la pestaña **"Actions"** de tu repositorio. Verás un proceso corriendo (círculo amarillo). Espera unos 5-10 minutos hasta que se ponga en verde (✅).
-7. Entra a ese proceso terminado y baja hasta la sección **"Artifacts"**. Ahí vas a ver **`macrosfit-apk`** — tócalo para descargarlo (te vas a bajar un .zip).
-8. Abre ese .zip descargado y extrae el archivo `app-debug.apk`.
-9. En tu Android, activa **"Instalar apps de origen desconocido"** (Ajustes → Seguridad, el nombre exacto varía según el celular).
-10. Abre el APK descargado y instálalo.
+## El único archivo que hay que crear a mano: `.github/workflows/build.yml`
+
+1. En tu repositorio, toca "Add file" → **"Create new file"**.
+2. En el campo del nombre, escribe exactamente: `.github/workflows/build.yml`
+   (al escribir las barras "/", GitHub crea las carpetas solo).
+3. Pega el contenido del archivo `build.yml` que viene en este mismo ZIP.
+4. Toca "Commit changes".
+
+## Después de subir todo
+
+1. Ve a la pestaña **"Actions"** de tu repositorio.
+2. Espera a que el proceso se ponga en verde (✅), unos 5-10 minutos.
+3. Entra a ese proceso → baja hasta "Artifacts" → descarga **`macrosfit-apk`**.
+4. Extrae el .zip descargado y ahí está `app-debug.apk`.
+5. Activa "Instalar apps de origen desconocido" en tu Android e instálalo.
 
 ## Para actualizar la app más adelante
 
-Cada vez que quieras subir una corrección:
-1. Ve a tu repositorio en GitHub.
-2. Sube el nuevo `app.jsx` (u otros archivos que hayan cambiado) a la carpeta `www/`, reemplazando el anterior.
-3. GitHub vuelve a compilar solo. Repite los pasos 6-10 para descargar el nuevo APK.
-
-## ¿Qué incluye este proyecto?
-
-- `www/` — el código de tu app (HTML + JSX + ícono), igual al que ya tenías funcionando en Netlify.
-- `package.json` y `capacitor.config.json` — la configuración de Capacitor, incluyendo el plugin de **notificaciones locales nativas** (para que las alarmas suenen aunque cierres la app o bloquees el celular).
-- `resources/icon.png` — tu logo, usado para generar automáticamente el ícono real de la app instalada.
-- `.github/workflows/build.yml` — la receta que le dice a GitHub cómo compilar el APK solo.
-
-## Nota sobre este primer APK
-
-Esta primera versión genera un **APK de depuración (debug)** — perfecto para instalar y probar en tu propio celular. Si más adelante quieres publicarlo en Google Play, se necesita un paso adicional (firmarlo con una clave propia), que podemos preparar cuando llegue el momento.
+Sube el `app.jsx` nuevo a la raíz (reemplazando el anterior) y GitHub vuelve
+a compilar solo.
