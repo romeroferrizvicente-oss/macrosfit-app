@@ -1,0 +1,12 @@
+{
+  "appId": "com.macrosfit.app",
+  "appName": "MacrosFit",
+  "webDir": "www",
+  "backgroundColor": "#0B1220",
+  "plugins": {
+    "LocalNotifications": {
+      "smallIcon": "ic_stat_icon",
+      "iconColor": "#FF6A00"
+    }
+  }
+}
