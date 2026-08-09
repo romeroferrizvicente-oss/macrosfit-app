@@ -129,10 +129,13 @@ function mfIsNative() {
 // download> NO es confiable: el WebView de Android no tiene forma de
 // guardar ese blob en el sistema de archivos real, así que a veces
 // "funciona" la primera vez por casualidad y luego se queda pegado sin
-// descargar nada. Por eso, dentro de la app usamos los plugins nativos
-// de Capacitor (Filesystem + Share), que sí escriben un archivo real y
-// abren el selector nativo para guardarlo/compartirlo, cada vez.
-// En el navegador seguimos usando blob + <a download>, que ahí es 100% confiable.
+// descargar nada. Por eso, dentro de la app usamos el plugin nativo de
+// Capacitor Filesystem, que sí escribe un archivo real directamente en la
+// carpeta Documentos del teléfono — SIN abrir el selector de "compartir
+// con..." (antes se usaba también el plugin Share, que abría esa ventana
+// para elegir app; el usuario prefiere que se guarde directo, sin elegir
+// nada). En el navegador seguimos usando blob + <a download>, que ahí es
+// 100% confiable.
 async function mfExportBackup() {
   const data = {};
   mfAllKeys().forEach(k => { data[k] = cache[k]; });
@@ -142,25 +145,19 @@ async function mfExportBackup() {
 
   if (mfIsNative()) {
     const Plugins = window.Capacitor.Plugins || {};
-    const { Filesystem, Share } = Plugins;
-    if (Filesystem && Share) {
+    const { Filesystem } = Plugins;
+    if (Filesystem) {
       try {
-        const written = await Filesystem.writeFile({
+        await Filesystem.writeFile({
           path: filename,
           data: json,
-          directory: "CACHE",
+          directory: "Documents",
           encoding: "utf8",
-        });
-        await Share.share({
-          title: "Copia de seguridad MacrosFit",
-          text: "Copia de seguridad de tus datos de MacrosFit",
-          url: written.uri,
-          dialogTitle: "Guardar copia de seguridad",
         });
         return true;
       } catch (e) {
         console.error("Error exportando (nativo):", e);
-        // si el camino nativo falla (p.ej. plugins no instalados), probamos el método web como último recurso
+        // si el camino nativo falla (p.ej. plugin no instalado), probamos el método web como último recurso
       }
     }
   }
@@ -338,15 +335,17 @@ async function mfSyncNativeAlarms() {
   const push = (title, body, hour, minute, weekday) => {
     const sched = { on: { hour, minute: minute || 0, allowWhileIdle: true }, repeats: true };
     if (weekday != null) sched.on.weekday = weekday;
-    // smallIcon/iconColor por notificación: respaldo por si el valor por defecto
-    // definido en capacitor.config.json (plugins.LocalNotifications) no se
-    // aplica en algún dispositivo. Debe existir el recurso nativo
-    // android/app/src/main/res/drawable-*/ic_stat_macrosfit.png (silueta blanca)
-    // para que Android deje de mostrar el ícono de "¡" por defecto.
+    // smallIcon/iconColor por notificación: respaldo por si el valor por
+    // defecto definido en capacitor.config.json (plugins.LocalNotifications)
+    // no se aplica en algún dispositivo. Debe coincidir exactamente con el
+    // nombre del recurso nativo que existe en
+    // android/app/src/main/res/drawable-*/ic_stat_icon.png — si no existe
+    // un recurso con ese nombre EXACTO, Android no muestra la notificación
+    // (falla en silencio, sin error visible).
     toSchedule.push({
       id: nextId++, title, body, schedule: sched,
-      smallIcon: "ic_stat_macrosfit",
-      iconColor: "#F97316",
+      smallIcon: "ic_stat_icon",
+      iconColor: "#FF6A00",
     });
   };
 
