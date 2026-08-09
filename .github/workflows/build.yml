@@ -57,6 +57,12 @@ jobs:
           cp notif-icon-xxhdpi.png  android/app/src/main/res/drawable-xxhdpi/ic_stat_icon.png
           cp notif-icon-xxxhdpi.png android/app/src/main/res/drawable-xxxhdpi/ic_stat_icon.png
 
+      - name: Agregar el plugin nativo MediaStoreSaver (guardar en Descargas)
+        run: |
+          mkdir -p android/app/src/main/java/com/macrosfit/app
+          cp MediaStoreSaver.java android/app/src/main/java/com/macrosfit/app/MediaStoreSaver.java
+          python3 patch-mainactivity.py
+
       - name: Sincronizar el código web dentro de Android
         run: npx cap sync android
 
