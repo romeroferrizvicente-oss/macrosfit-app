@@ -150,6 +150,26 @@ async function mfExportBackup() {
     if (MediaStoreSaver) {
       try {
         await MediaStoreSaver.save({ filename, data: json, mimeType: "application/json" });
+        // Como el archivo se guarda directo (sin pasar por el selector ni
+        // por el Administrador de descargas de Android), el sistema no
+        // muestra su típico aviso de "Descarga completa". Disparamos
+        // nuestra propia notificación para avisarle al usuario, usando el
+        // mismo canal con sonido que ya armamos para las alarmas.
+        try {
+          const LN = Plugins.LocalNotifications;
+          if (LN) {
+            await LN.schedule({ notifications: [{
+              id: 999999,
+              title: "✅ Copia de seguridad guardada",
+              body: `${filename} se guardó en Descargas.`,
+              schedule: { at: new Date(Date.now() + 500) },
+              smallIcon: "ic_stat_icon",
+              iconColor: "#FF6A00",
+              channelId: "macrosfit_alarms",
+              sound: "default",
+            }] });
+          }
+        } catch {}
         return true;
       } catch (e) {
         console.error("Error exportando (nativo):", e);
