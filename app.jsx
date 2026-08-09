@@ -129,13 +129,14 @@ function mfIsNative() {
 // download> NO es confiable: el WebView de Android no tiene forma de
 // guardar ese blob en el sistema de archivos real, así que a veces
 // "funciona" la primera vez por casualidad y luego se queda pegado sin
-// descargar nada. Por eso, dentro de la app usamos el plugin nativo de
-// Capacitor Filesystem, que sí escribe un archivo real directamente en la
-// carpeta Documentos del teléfono — SIN abrir el selector de "compartir
-// con..." (antes se usaba también el plugin Share, que abría esa ventana
-// para elegir app; el usuario prefiere que se guarde directo, sin elegir
-// nada). En el navegador seguimos usando blob + <a download>, que ahí es
-// 100% confiable.
+// descargar nada. Probamos primero con el plugin Filesystem normal
+// (Directory "Documents"/"External"), pero en Android 10+ esas carpetas o
+// dan error o quedan en una ruta que el usuario no puede ver desde su
+// explorador de archivos (Android bloquea el acceso a la carpeta interna
+// de cada app). Por eso usamos "MediaStoreSaver", un plugin nativo propio
+// que guarda el archivo directo en la carpeta pública "Descargas" usando
+// la misma API que usa Chrome para descargar — sin selector, sin pedir
+// permisos, y sí visible en el explorador de archivos del teléfono.
 async function mfExportBackup() {
   const data = {};
   mfAllKeys().forEach(k => { data[k] = cache[k]; });
@@ -145,22 +146,10 @@ async function mfExportBackup() {
 
   if (mfIsNative()) {
     const Plugins = window.Capacitor.Plugins || {};
-    const { Filesystem } = Plugins;
-    if (Filesystem) {
+    const { MediaStoreSaver } = Plugins;
+    if (MediaStoreSaver) {
       try {
-        try { await Filesystem.requestPermissions(); } catch {}
-        // "DOCUMENTS" da error FILE_NOTCREATED en Android 10+ (esa carpeta
-        // queda restringida por el sistema y el plugin no puede crear el
-        // archivo ahí). "EXTERNAL" apunta a la carpeta propia de la app
-        // dentro del almacenamiento del teléfono — no pide permisos y
-        // siempre se puede escribir, en cualquier versión de Android.
-        await Filesystem.writeFile({
-          path: filename,
-          data: json,
-          directory: "EXTERNAL",
-          encoding: "utf8",
-          recursive: true,
-        });
+        await MediaStoreSaver.save({ filename, data: json, mimeType: "application/json" });
         return true;
       } catch (e) {
         console.error("Error exportando (nativo):", e);
@@ -169,7 +158,7 @@ async function mfExportBackup() {
         // que seguir a ese camino solo da la falsa impresión de que "no
         // pasa nada". Mejor mostramos el motivo REAL del error en pantalla,
         // para poder identificar exactamente qué está fallando.
-        try { window.alert("No se pudo guardar la copia:\n\n" + (e && e.message ? e.message : String(e))); } catch {}
+        try { window.alert("No se pudo guardar la copia en Descargas:\n\n" + (e && e.message ? e.message : String(e))); } catch {}
         return false;
       }
     }
