@@ -1,0 +1,73 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      - name: Instalar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Instalar Java (necesario para compilar Android)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Instalar dependencias
+        run: npm install
+
+      - name: Reconstruir la carpeta www/ a partir de los archivos sueltos
+        run: |
+          mkdir -p www
+          cp index.html app.jsx icon.png manifest.json www/
+
+      - name: Reconstruir la carpeta resources/ (para el ícono de la app)
+        run: |
+          mkdir -p resources
+          cp icon.png resources/icon.png
+          cp icon.png resources/splash.png
+
+      - name: Agregar la plataforma Android
+        run: npx cap add android
+
+      - name: Generar el ícono real de la app a partir del logo
+        run: npx capacitor-assets generate --android
+        continue-on-error: true
+
+      - name: Copiar el ícono de la barra de notificaciones (silueta blanca)
+        run: |
+          mkdir -p android/app/src/main/res/drawable-mdpi
+          mkdir -p android/app/src/main/res/drawable-hdpi
+          mkdir -p android/app/src/main/res/drawable-xhdpi
+          mkdir -p android/app/src/main/res/drawable-xxhdpi
+          mkdir -p android/app/src/main/res/drawable-xxxhdpi
+          cp notif-icon-mdpi.png    android/app/src/main/res/drawable-mdpi/ic_stat_icon.png
+          cp notif-icon-hdpi.png    android/app/src/main/res/drawable-hdpi/ic_stat_icon.png
+          cp notif-icon-xhdpi.png   android/app/src/main/res/drawable-xhdpi/ic_stat_icon.png
+          cp notif-icon-xxhdpi.png  android/app/src/main/res/drawable-xxhdpi/ic_stat_icon.png
+          cp notif-icon-xxxhdpi.png android/app/src/main/res/drawable-xxxhdpi/ic_stat_icon.png
+
+      - name: Sincronizar el código web dentro de Android
+        run: npx cap sync android
+
+      - name: Dar permiso de ejecución a Gradle
+        run: chmod +x android/gradlew
+
+      - name: Compilar el APK
+        run: cd android && ./gradlew assembleDebug
+
+      - name: Subir el APK para descargar
+        uses: actions/upload-artifact@v4
+        with:
+          name: macrosfit-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
