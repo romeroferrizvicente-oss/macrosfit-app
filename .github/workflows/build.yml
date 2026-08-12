@@ -31,6 +31,13 @@ jobs:
           mkdir -p www
           cp index.html app.jsx icon.png manifest.json www/
 
+      - name: Descargar React, ReactDOM y Babel para que funcionen sin internet
+        run: |
+          mkdir -p www/vendor
+          curl -sL https://unpkg.com/react@18/umd/react.production.min.js -o www/vendor/react.production.min.js
+          curl -sL https://unpkg.com/react-dom@18/umd/react-dom.production.min.js -o www/vendor/react-dom.production.min.js
+          curl -sL https://unpkg.com/@babel/standalone/babel.min.js -o www/vendor/babel.min.js
+
       - name: Reconstruir la carpeta resources/ (para el ícono de la app)
         run: |
           mkdir -p resources
