@@ -149,7 +149,37 @@ async function mfExportBackup() {
     const { MediaStoreSaver } = Plugins;
     if (MediaStoreSaver) {
       try {
-        await MediaStoreSaver.save({ filename, data: json, mimeType: "application/json" });
+        // IMPORTANTE: la copia puede pesar varios MB (fotos de progreso en
+        // base64). Mandarla de golpe por el puente nativo hace que el WebView
+        // de Android se quede sin memoria y la app se cierre. Por eso se
+        // envía en pedazos chicos: begin -> append (varias veces) -> finish.
+        // Si el plugin nativo es una versión vieja sin esos métodos, se usa
+        // el guardado en una sola llamada como antes.
+        let usedChunks = false;
+        try {
+          await MediaStoreSaver.begin({ filename, mimeType: "application/json" });
+          usedChunks = true;
+          const CHUNK = 200000;
+          let pos = 0;
+          while (pos < json.length) {
+            let end = Math.min(pos + CHUNK, json.length);
+            // no cortar a la mitad de un emoji (par de caracteres sustitutos)
+            if (end < json.length) {
+              const c = json.charCodeAt(end - 1);
+              if (c >= 0xD800 && c <= 0xDBFF) end--;
+            }
+            await MediaStoreSaver.append({ data: json.slice(pos, end) });
+            pos = end;
+            await new Promise(r => setTimeout(r, 15)); // respiro para liberar memoria
+          }
+          await MediaStoreSaver.finish();
+        } catch (chunkErr) {
+          if (usedChunks) {
+            try { await MediaStoreSaver.abort(); } catch {}
+            throw chunkErr;
+          }
+          await MediaStoreSaver.save({ filename, data: json, mimeType: "application/json" });
+        }
         // Como el archivo se guarda directo (sin pasar por el selector ni
         // por el Administrador de descargas de Android), el sistema no
         // muestra su típico aviso de "Descarga completa". Disparamos
@@ -340,6 +370,25 @@ async function mfSyncNativeAlarms() {
     }
   } catch {}
 
+  // Android 12+ exige, ADEMÁS del permiso de notificaciones, un permiso
+  // aparte de "Alarmas y recordatorios" (alarma exacta) para que las
+  // notificaciones programadas disparen a la hora exacta. Sin este
+  // permiso el sistema las puede posponer o no dispararlas nunca, aunque
+  // el permiso normal de notificaciones esté concedido. Lo pedimos una
+  // sola vez (mandando al usuario a Ajustes, que es como el sistema
+  // operativo obliga a concederlo) y no insistimos en cada sync.
+  try {
+    if (typeof LN.checkExactNotificationSetting === "function") {
+      const exact = await LN.checkExactNotificationSetting();
+      if (exact.exact_alarm !== "granted"
+          && memStorage.getItem("mf_asked_exact_alarm") !== "1"
+          && typeof LN.changeExactNotificationSetting === "function") {
+        memStorage.setItem("mf_asked_exact_alarm", "1");
+        await LN.changeExactNotificationSetting();
+      }
+    }
+  } catch {}
+
   // En Android, el sonido/importancia de una notificación depende del
   // "canal" al que pertenece, y esos valores quedan FIJOS la primera vez
   // que Android crea ese canal — no se pueden cambiar después desde el
@@ -370,6 +419,7 @@ async function mfSyncNativeAlarms() {
   try { prof = JSON.parse(memStorage.getItem("mf_profile") || "{}"); } catch {}
   let vitamins = [];
   try { vitamins = JSON.parse(memStorage.getItem("mf_vitamins") || "[]"); } catch {}
+  vitamins = vitamins.filter(v => v.active !== false);
 
   const toSchedule = [];
   let nextId = 1000;
@@ -1080,6 +1130,12 @@ function SortButton({ sortField, sortDir, onChange }) {
             style={{ position:"fixed",top:rect.bottom+6,right:Math.max(8,window.innerWidth-rect.right),background:"#fff",borderRadius:14,
               boxShadow:"0 4px 20px rgba(0,0,0,0.15)",overflow:"hidden",minWidth:220,zIndex:901 }}>
             <div style={{ padding:"10px 14px 6px",fontSize:11,fontWeight:700,color:"#9CA3AF",letterSpacing:0.5 }}>ORDENAR POR</div>
+            <button onClick={()=>{onChange(null,null);setOpen(false);}}
+              style={{ width:"100%",padding:"11px 14px",border:"none",background:!active?"#EEF3FF":"none",
+                cursor:"pointer",fontSize:13,fontWeight:700,color:"#1E2A3A",textAlign:"left",display:"flex",alignItems:"center",justifyContent:"space-between" }}>
+              <span>✋ Personalizado</span><span style={{ color:"#9CA3AF",fontSize:11 }}>mi orden</span>
+            </button>
+            <div style={{ height:1,background:"#F0F2F5" }}/>
             {SORT_FIELDS.map(f=>(
               <div key={f.key}>
                 <button onClick={()=>{onChange(f.key,"desc");setOpen(false);}}
@@ -1095,17 +1151,197 @@ function SortButton({ sortField, sortDir, onChange }) {
                 <div style={{ height:1,background:"#F0F2F5" }}/>
               </div>
             ))}
-            {active && (
-              <button onClick={()=>{onChange(null,null);setOpen(false);}}
-                style={{ width:"100%",padding:"11px 14px",border:"none",background:"none",cursor:"pointer",
-                  fontSize:13,fontWeight:700,color:"#FF4D6D",textAlign:"left" }}>
-                ✕ Quitar orden
-              </button>
-            )}
           </div>
         </>
       )}
     </div>
+  );
+}
+
+
+
+// Orden por defecto de la lista de Alimentos: A-Z con los favoritos primero.
+function mfFoodsDefaultOrder(foods) {
+  const l = [...foods].sort((a,b) => a.name.localeCompare(b.name, "es", { sensitivity:"base" }));
+  return l.sort((a,b) => (b.favorite?1:0) - (a.favorite?1:0));
+}
+// ── Mover el orden manteniendo presionado (4 segundos) ─────────
+// Envuelve una lista de tarjetas. Si el usuario deja presionada una
+// tarjeta 4 segundos (sin mover el dedo), "se levanta" y puede arrastrarla
+// a la posición que quiera. Al soltar, se llama onReorder(clavesEnNuevoOrden).
+function mfApplySubsetOrder(full, newKeys, getKey) {
+  const set = new Set(newKeys);
+  const byKey = new Map(full.filter(x => set.has(getKey(x))).map(x => [getKey(x), x]));
+  let i = 0;
+  return full.map(x => set.has(getKey(x)) ? byKey.get(newKeys[i++]) : x);
+}
+function mfScrollParent(el) {
+  let n = el ? el.parentElement : null;
+  while (n && n !== document.body) {
+    const oy = getComputedStyle(n).overflowY;
+    if ((oy === "auto" || oy === "scroll") && n.scrollHeight > n.clientHeight) return n;
+    n = n.parentElement;
+  }
+  return null;
+}
+function HoldReorderList({ items, getKey, onReorder, renderItem, holdMs=4000, grid=false }) {
+  const wrapRefs = useRef({});
+  const st = useRef({});
+  const timers = useRef({ hold:null, prog:null, raf:null });
+  const [drag, setDrag] = useState(null);
+  const [holding, setHolding] = useState(null);
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
+  const onReorderRef = useRef(onReorder);
+  onReorderRef.current = onReorder;
+
+  const clearHold = () => {
+    clearTimeout(timers.current.hold);
+    clearInterval(timers.current.prog);
+    setHolding(null);
+  };
+  useEffect(() => () => {
+    clearTimeout(timers.current.hold); clearInterval(timers.current.prog);
+    cancelAnimationFrame(timers.current.raf);
+  }, []);
+
+  const compute = () => {
+    const s = st.current;
+    const scTop = s.scEl ? s.scEl.scrollTop : 0;
+    const dy = (s.curY - s.startY) + (scTop - s.scStart);
+    const dx = grid ? (s.curX - s.startX) : 0;
+    const c = s.centers[s.idx] + dy;
+    let target = 0;
+    if (grid) {
+      const cx = s.centersX[s.idx] + dx;
+      let best = Infinity;
+      s.centers.forEach((o, i) => {
+        const d = (o - c) * (o - c) + (s.centersX[i] - cx) * (s.centersX[i] - cx);
+        if (d < best) { best = d; target = i; }
+      });
+    } else {
+      s.centers.forEach((o, i) => { if (i !== s.idx && o < c) target++; });
+    }
+    s.target = target; s.dy = dy;
+    setDrag({ key: s.key, idx: s.idx, target, dx, dy, h: s.h + s.gap, cxs: s.centersX, cys: s.centers });
+  };
+
+  const activate = (key) => {
+    clearInterval(timers.current.prog);
+    setHolding(null);
+    const list = itemsRef.current;
+    const idx = list.findIndex(i => getKey(i) === key);
+    if (idx < 0) return;
+    const scEl = mfScrollParent(wrapRefs.current[key]);
+    const scTop = scEl ? scEl.scrollTop : 0;
+    const rects = list.map(i => wrapRefs.current[getKey(i)].getBoundingClientRect());
+    const centers = rects.map(r => r.top + r.height / 2 + scTop);
+    const centersX = rects.map(r => r.left + r.width / 2);
+    const gap = rects.length > 1 ? Math.max(0, rects[1].top - rects[0].bottom) : 0;
+    Object.assign(st.current, { active: true, idx, key, centers, centersX, scEl, scStart: scTop, target: idx, dy: 0, h: rects[idx].height, gap });
+    if (navigator.vibrate) { try { navigator.vibrate(60); } catch {} }
+    compute();
+
+    const move = (e) => {
+      if (!st.current.active) return;
+      if (e.cancelable) e.preventDefault();
+      const pt = e.touches ? e.touches[0] : e;
+      if (!pt) return;
+      st.current.curY = pt.clientY;
+      st.current.curX = pt.clientX;
+      compute();
+    };
+    const end = () => {
+      document.removeEventListener("touchmove", move);
+      document.removeEventListener("touchend", end);
+      document.removeEventListener("touchcancel", end);
+      document.removeEventListener("mousemove", move);
+      document.removeEventListener("mouseup", end);
+      cancelAnimationFrame(timers.current.raf);
+      const s = st.current;
+      s.active = false;
+      s.justDragged = Date.now();
+      const cur = itemsRef.current.map(getKey);
+      if (s.target !== s.idx) {
+        const k = cur.splice(s.idx, 1)[0];
+        cur.splice(s.target, 0, k);
+        onReorderRef.current(cur);
+      }
+      setDrag(null);
+    };
+    document.addEventListener("touchmove", move, { passive: false });
+    document.addEventListener("touchend", end);
+    document.addEventListener("touchcancel", end);
+    document.addEventListener("mousemove", move);
+    document.addEventListener("mouseup", end);
+
+    const loop = () => {
+      const s = st.current;
+      if (!s.active) return;
+      if (s.scEl && s.curY != null) {
+        const r = s.scEl.getBoundingClientRect();
+        if (s.curY < r.top + 70) { s.scEl.scrollTop -= 12; compute(); }
+        else if (s.curY > r.bottom - 70) { s.scEl.scrollTop += 12; compute(); }
+      }
+      timers.current.raf = requestAnimationFrame(loop);
+    };
+    timers.current.raf = requestAnimationFrame(loop);
+  };
+
+  const startHold = (key, e) => {
+    if (st.current.active) return;
+    const pt = e.touches ? e.touches[0] : e;
+    st.current.startX = pt.clientX; st.current.startY = pt.clientY; st.current.curY = pt.clientY; st.current.curX = pt.clientX;
+    clearHold();
+    setHolding({ key, progress: 0 });
+    const t0 = Date.now();
+    timers.current.prog = setInterval(() => setHolding(h => h ? { ...h, progress: Math.min((Date.now() - t0) / holdMs, 1) } : h), 60);
+    timers.current.hold = setTimeout(() => activate(key), holdMs);
+  };
+  const moveWhileHolding = (e) => {
+    if (st.current.active || !holding) return;
+    const pt = e.touches ? e.touches[0] : e;
+    if (Math.abs(pt.clientX - st.current.startX) > 10 || Math.abs(pt.clientY - st.current.startY) > 10) clearHold();
+  };
+
+  return (
+    <>
+      {items.map((item, i) => {
+        const key = getKey(item);
+        const isDrag = drag && drag.key === key;
+        let ty = 0, tx = 0;
+        if (drag && !isDrag) {
+          if (grid) {
+            let j = -1;
+            if (drag.idx < drag.target && i > drag.idx && i <= drag.target) j = i - 1;
+            else if (drag.target < drag.idx && i >= drag.target && i < drag.idx) j = i + 1;
+            if (j >= 0) { tx = drag.cxs[j] - drag.cxs[i]; ty = drag.cys[j] - drag.cys[i]; }
+          } else if (drag.idx < drag.target && i > drag.idx && i <= drag.target) ty = -drag.h;
+          else if (drag.target < drag.idx && i >= drag.target && i < drag.idx) ty = drag.h;
+        }
+        return (
+          <div key={key} ref={el => { wrapRefs.current[key] = el; }}
+            onTouchStart={e => startHold(key, e)} onTouchMove={moveWhileHolding} onTouchEnd={clearHold} onTouchCancel={clearHold}
+            onMouseDown={e => startHold(key, e)} onMouseMove={moveWhileHolding} onMouseUp={clearHold} onMouseLeave={clearHold}
+            onContextMenu={e => e.preventDefault()}
+            onClickCapture={e => { if (st.current.justDragged && Date.now() - st.current.justDragged < 400) { e.stopPropagation(); e.preventDefault(); } }}
+            style={{
+              position: "relative", userSelect: "none", WebkitUserSelect: "none", WebkitTouchCallout: "none",
+              transform: isDrag ? `translate(${grid ? drag.dx : 0}px, ${drag.dy}px) scale(1.03)` : ((tx || ty) ? `translate(${tx}px, ${ty}px)` : undefined),
+              transition: isDrag ? "none" : (drag ? "transform 0.18s ease" : undefined),
+              zIndex: isDrag ? 60 : undefined,
+              filter: isDrag ? "drop-shadow(0 10px 18px rgba(0,0,0,0.35))" : undefined,
+              opacity: isDrag ? 0.97 : 1,
+            }}>
+            {renderItem(item, i)}
+            {holding && holding.key === key && (
+              <div style={{ position: "absolute", bottom: 0, left: 0, height: 3, width: `${holding.progress * 100}%`,
+                background: "#4D9DE0", borderRadius: 99, zIndex: 3, pointerEvents: "none" }}/>
+            )}
+          </div>
+        );
+      })}
+    </>
   );
 }
 
@@ -1182,10 +1418,10 @@ function FoodListCard({ food, expanded, onToggle, onLog, onEdit, onDelete, onTog
             <span style={{ fontSize:11,color: false?"#9CA3AF":t.labelColor,fontWeight:400 }}>por {food.qty||100}{food.unit||"g"}{food.unit==="p"&&food.gramsPerPiece?` (${food.gramsPerPiece}g)`:""}</span>
           </div>
           <div style={{ fontSize:12 }}>
-            <span style={{ color:"#F472B6",fontWeight:600 }}>{food.kcal} kcal</span>
-            <span style={{ color: false?"#9CA3AF":t.labelColor }}> · </span><span style={{ color:"#60A5FA",fontWeight:600 }}>{food.p}g P</span>
-            <span style={{ color: false?"#9CA3AF":t.labelColor }}> · </span><span style={{ color:"#FBBF24",fontWeight:600 }}>{food.c}g C</span>
-            <span style={{ color: false?"#9CA3AF":t.labelColor }}> · </span><span style={{ color:"#4ADE80",fontWeight:600 }}>{food.g}g G</span>
+            <span style={{ color:"#F472B6",fontWeight:600 }}>{mfRound2(food.kcal)} kcal</span>
+            <span style={{ color: false?"#9CA3AF":t.labelColor }}> · </span><span style={{ color:"#60A5FA",fontWeight:600 }}>{mfRound2(food.p)}g P</span>
+            <span style={{ color: false?"#9CA3AF":t.labelColor }}> · </span><span style={{ color:"#FBBF24",fontWeight:600 }}>{mfRound2(food.c)}g C</span>
+            <span style={{ color: false?"#9CA3AF":t.labelColor }}> · </span><span style={{ color:"#4ADE80",fontWeight:600 }}>{mfRound2(food.g)}g G</span>
           </div>
         </div>
         <button onClick={e=>{e.stopPropagation(); if(cardRef.current) setLockedH(cardRef.current.offsetHeight); setMenuOpen(true);}}
@@ -1218,10 +1454,10 @@ function FoodListCard({ food, expanded, onToggle, onLog, onEdit, onDelete, onTog
           <div style={{ fontSize:12,fontWeight:700,color:"#6B7280",marginBottom:8 }}>Totales</div>
           <div style={{ display:"flex",gap:8 }}>
             {[
-              { l:"kcal",          v:cKcal,      c:"#F472B6", bg:"#FFF0F6" },
-              { l:"Proteínas",     v:`${cP}g`,   c:"#60A5FA", bg:"#EEF3FF" },
-              { l:"Carbohidratos", v:`${cC}g`,   c:"#FBBF24", bg:"#FFFBEB" },
-              { l:"Grasas",        v:`${cG}g`,   c:"#4ADE80", bg:"#F0FDF4" },
+              { l:"kcal",          v:mfRound2(cKcal),      c:"#F472B6", bg:"#FFF0F6" },
+              { l:"Proteínas",     v:`${mfRound2(cP)}g`,   c:"#60A5FA", bg:"#EEF3FF" },
+              { l:"Carbohidratos", v:`${mfRound2(cC)}g`,   c:"#FBBF24", bg:"#FFFBEB" },
+              { l:"Grasas",        v:`${mfRound2(cG)}g`,   c:"#4ADE80", bg:"#F0FDF4" },
             ].map(t => (
               <div key={t.l} style={{ flex:1,background:t.bg,borderRadius:14,padding:"10px 4px",textAlign:"center" }}>
                 <div style={{ fontWeight:800,fontSize:15,color:t.c }}>{t.v}</div>
@@ -1279,8 +1515,8 @@ function PortionModal({ food, onLog, onClose, theme=0, bgTheme=0 }) {
         ))}
       </div>
       <div style={{ display:"flex",gap:8,marginBottom:20,flexShrink:0 }}>
-        {[{l:"kcal",v:cKcal,c:"#4D9DE0",bg:"#EEF3FF"},{l:"Prot",v:`${cP}g`,c:"#F472B6",bg:"#FFF0F6"},
-          {l:"Carb",v:`${cC}g`,c:"#FBBF24",bg:"#FFFBEB"},{l:"Gras",v:`${cG}g`,c:"#4ADE80",bg:"#F0FDF4"}].map(t => (
+        {[{l:"kcal",v:mfRound2(cKcal),c:"#4D9DE0",bg:"#EEF3FF"},{l:"Prot",v:`${mfRound2(cP)}g`,c:"#F472B6",bg:"#FFF0F6"},
+          {l:"Carb",v:`${mfRound2(cC)}g`,c:"#FBBF24",bg:"#FFFBEB"},{l:"Gras",v:`${mfRound2(cG)}g`,c:"#4ADE80",bg:"#F0FDF4"}].map(t => (
           <div key={t.l} style={{ flex:1,background:t.bg,borderRadius:14,padding:"10px 6px",textAlign:"center" }}>
             <div style={{ fontWeight:800,fontSize:16,color:t.c }}>{t.v}</div>
             <div style={{ fontSize:10,color:"#9CA3AF",fontWeight:600 }}>{t.l}</div>
@@ -1351,10 +1587,10 @@ function HistoryModal({ log, onDelete, onClose, theme=0, bgTheme=0 }) {
       {log.length>0 && (
         <div style={{ display:"flex",gap:8,marginBottom:14,flexShrink:0 }}>
           {[
-            {l:"kcal",  v:tk,     c:"#4D9DE0", bg:"#EEF3FF"},
-            {l:"Prot",  v:`${tp}g`, c:"#F472B6", bg:"#FFF0F6"},
-            {l:"Carb",  v:`${tc}g`, c:"#FBBF24", bg:"#FFFBEB"},
-            {l:"Grasas",v:`${tg}g`, c:"#4ADE80", bg:"#F0FDF4"},
+            {l:"kcal",  v:mfRound2(tk),     c:"#4D9DE0", bg:"#EEF3FF"},
+            {l:"Prot",  v:`${mfRound2(tp)}g`, c:"#F472B6", bg:"#FFF0F6"},
+            {l:"Carb",  v:`${mfRound2(tc)}g`, c:"#FBBF24", bg:"#FFFBEB"},
+            {l:"Grasas",v:`${mfRound2(tg)}g`, c:"#4ADE80", bg:"#F0FDF4"},
           ].map(t=>(
             <div key={t.l} style={{ flex:1,background:t.bg,borderRadius:14,padding:"10px 6px",textAlign:"center" }}>
               <div style={{ fontWeight:800,fontSize:16,color:t.c }}>{t.v}</div>
@@ -1558,6 +1794,8 @@ function VitaminsTab({ onBack, theme=0, bgTheme=0 }) {
   const [sheetLayer, setSheetLayer] = useState(0);
   const bumpSheetLayer = useCallback(d => setSheetLayer(c => Math.max(0, c+d)), []);
   const [showAdd, setShowAdd]   = useState(false);
+  const [showPicker, setShowPicker] = useState(false);
+  const [customOrder, setCustomOrder] = usePersist("mf_vitamins_custom", false);
   const [editing, setEditing]   = useState(null);
   const [notifOk, setNotifOk]   = useState(typeof Notification!=="undefined" && Notification.permission==="granted");
 
@@ -1578,6 +1816,7 @@ function VitaminsTab({ onBack, theme=0, bgTheme=0 }) {
       const vMode = mfModeOf(profile, "notifVitamins");
       if (vMode === "off") return;
       vitamins.forEach(v => {
+        if (v.active===false) return;
         const dayOk = !v.days || v.days.length===0 || v.days.includes(now.getDay());
         if (dayOk && v.alarm && v.alarm===hhmm && v.lastFired!==hhmm+"_"+now.toDateString() && v.takenDate!==now.toDateString()) {
           mfSendReminder(vMode, "💊 Hora de tu vitamina", `${v.name} — ${v.pills} pastilla${v.pills!=1?"s":""} (${v.mg} mg)`);
@@ -1654,7 +1893,11 @@ function VitaminsTab({ onBack, theme=0, bgTheme=0 }) {
   // Ordena las vitaminas por hora de alarma: la más temprana arriba (ej.
   // 8:00 AM) y la más tardía abajo (ej. 11:00 PM). Las que no tienen
   // alarma configurada van al final.
-  const sortedVitamins = [...vitamins].sort((a, b) => {
+  // Solo se muestran las vitaminas que el usuario eligió tomar (botón de
+  // la pastilla). Si el usuario ya las acomodó a mano (dejando presionada
+  // una tarjeta 4 segundos), se respeta su orden; si no, van por hora.
+  const activeVitamins = vitamins.filter(v => v.active !== false);
+  const sortedVitamins = customOrder ? activeVitamins : [...activeVitamins].sort((a, b) => {
     if (!a.alarm && !b.alarm) return 0;
     if (!a.alarm) return 1;
     if (!b.alarm) return -1;
@@ -1672,6 +1915,11 @@ function VitaminsTab({ onBack, theme=0, bgTheme=0 }) {
           <img src={ICONS.vitaminas} alt="" style={{ width:24,height:24,objectFit:"contain" }}/>
           <div style={{ fontSize:20,fontWeight:900,color:cardTheme(theme).textColor }}>Vitaminas</div>
         </div>
+        <button onClick={()=>setShowPicker(true)} aria-label="Elegir vitaminas a tomar"
+          style={{ width:40,height:40,borderRadius:"50%",background: false?"#fff":cardTheme(theme).bg,border:`2.5px solid ${false?"#4D9DE0":(cardTheme(theme).accent||cardTheme(theme).textColor)}`,
+            cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,fontSize:19,lineHeight:1,padding:0 }}>
+          💊
+        </button>
         <button onClick={()=>{setEditing(null);setShowAdd(true);}}
           style={{ width:40,height:40,borderRadius:"50%",background: false?"#fff":cardTheme(theme).bg,border:`2.5px solid ${false?"#4D9DE0":(cardTheme(theme).accent||cardTheme(theme).textColor)}`,
             cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0 }}>
@@ -1681,26 +1929,73 @@ function VitaminsTab({ onBack, theme=0, bgTheme=0 }) {
 
       <div style={{ flex:1,minHeight:0,overflowY:"auto",WebkitOverflowScrolling:"touch",overscrollBehavior:"contain",paddingBottom:76 }}>
       <div style={{ padding:"16px 14px" }}>
-        {vitamins.length === 0 ? (
+        {activeVitamins.length === 0 ? (
           <div style={{ background:cardTheme(theme).bg,...glassProps(cardTheme(theme)),borderRadius:18,padding:"40px 20px",textAlign:"center",boxShadow:cardTheme(theme).shadow,border:cardTheme(theme).border }}>
             <img src={ICONS.vitaminas} alt="" style={{ width:40,height:40,objectFit:"contain",margin:"0 auto 12px" }}/>
-            <div style={{ fontWeight:700,fontSize:15,color:cardTheme(theme).textColor,marginBottom:6 }}>Sin vitaminas registradas</div>
-            <div style={{ fontSize:13,color:cardTheme(theme).labelColor }}>Toca + para agregar la primera</div>
+            <div style={{ fontWeight:700,fontSize:15,color:cardTheme(theme).textColor,marginBottom:6 }}>{vitamins.length===0 ? "Sin vitaminas registradas" : "No elegiste ninguna vitamina"}</div>
+            <div style={{ fontSize:13,color:cardTheme(theme).labelColor }}>{vitamins.length===0 ? "Toca + para agregar la primera" : "Toca 💊 para elegir cuáles vas a tomar"}</div>
           </div>
-        ) : sortedVitamins.map(v => (
-          <VitaminRow key={v.id} v={v} status={getStatus(v)} theme={theme}
-            onEdit={()=>{setEditing(v);setShowAdd(true);}}
-            onDelete={()=>del(v.id)}
-            onMarkTaken={()=>markTaken(v.id)}/>
-        ))}
+        ) : (
+          <HoldReorderList items={sortedVitamins} getKey={v=>v.id}
+            onReorder={keys=>{ setVitamins(l=>mfApplySubsetOrder(l, keys, x=>x.id)); setCustomOrder(true); }}
+            renderItem={v => (
+              <VitaminRow v={v} status={getStatus(v)} theme={theme}
+                onEdit={()=>{setEditing(v);setShowAdd(true);}}
+                onDelete={()=>del(v.id)}
+                onMarkTaken={()=>markTaken(v.id)}/>
+            )}/>
+        )}
       </div>
       </div>
 
+      {showPicker && (
+        <VitaminPickerSheet vitamins={vitamins} theme={theme} bgTheme={bgTheme}
+          onToggle={id=>setVitamins(l=>l.map(x=>x.id===id?{...x,active:x.active===false}:x))}
+          onClose={()=>setShowPicker(false)}/>
+      )}
       {showAdd && (
         <VitaminFormSheet initial={editing} onSave={save} onClose={()=>{setShowAdd(false);setEditing(null);}} theme={theme} bgTheme={bgTheme}/>
       )}
     </div>
     </SheetLayerCtx.Provider>
+  );
+}
+
+
+// Ventana para elegir cuáles de las vitaminas creadas va a tomar el usuario.
+// Las que quedan sin marcar se ocultan de la lista y no suenan sus alarmas.
+function VitaminPickerSheet({ vitamins, onToggle, onClose, theme=0, bgTheme=0 }) {
+  const t = cardTheme(theme);
+  const chosen = vitamins.filter(v => v.active !== false).length;
+  return (
+    <Sheet onClose={onClose} maxH="85vh" theme={theme} bgTheme={bgTheme}>
+      <SheetHeader title="💊 ¿Cuáles vas a tomar?" sub={vitamins.length ? `${chosen} de ${vitamins.length} elegidas` : "Aún no creaste vitaminas."} onClose={onClose} theme={theme}/>
+      <div style={{ flex:1,minHeight:0,overflowY:"auto",marginBottom:12 }}>
+        {vitamins.length === 0 && (
+          <div style={{ textAlign:"center",padding:"24px 10px",fontSize:13,color:t.labelColor }}>Primero crea tus vitaminas con el botón +.</div>
+        )}
+        {vitamins.map(v => {
+          const on = v.active !== false;
+          return (
+            <button key={v.id} onClick={()=>onToggle(v.id)}
+              style={{ width:"100%",display:"flex",alignItems:"center",gap:12,padding:"12px 14px",marginBottom:8,borderRadius:14,cursor:"pointer",textAlign:"left",
+                background:on?"rgba(34,197,94,0.14)":"rgba(120,120,120,0.10)",
+                border:`2px solid ${on?"#22C55E":"rgba(120,120,120,0.25)"}` }}>
+              <div style={{ width:26,height:26,borderRadius:8,flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center",
+                background:on?"#22C55E":"transparent",border:`2px solid ${on?"#22C55E":"rgba(120,120,120,0.5)"}`,color:"#fff",fontSize:16,fontWeight:900 }}>{on?"✓":""}</div>
+              <div style={{ flex:1,minWidth:0 }}>
+                <div style={{ fontWeight:800,fontSize:15,color:t.textColor }}>{v.name}</div>
+                <div style={{ fontSize:12,color:t.labelColor,marginTop:2 }}>{v.pills} cápsula{v.pills!=1?"s":""} · {v.mg} mg{v.alarm?` · ${fmtTime12(v.alarm)}`:""}</div>
+              </div>
+            </button>
+          );
+        })}
+      </div>
+      <button onClick={onClose}
+        style={{ flexShrink:0,width:"100%",padding:"14px 0",borderRadius:14,border:"none",cursor:"pointer",background:"#2563EB",color:"#FFFFFF",fontSize:16,fontWeight:800 }}>
+        Listo
+      </button>
+    </Sheet>
   );
 }
 
@@ -1856,10 +2151,13 @@ function VitaminFormSheet({ initial, onSave, onClose, theme=0, bgTheme=0 }) {
   );
 }
 
-function MisComidasTab({ foods, meals, onSaveMeal, onLogMeal, onDelete, onToggleFavorite, onBack, theme=0, bgTheme=0 }) {
+function MisComidasTab({ foods, meals, setMeals, onSaveMeal, onLogMeal, onDelete, onToggleFavorite, onBack, theme=0, bgTheme=0 }) {
   useBackClose(onBack);
+  const [customOrder, setCustomOrder] = usePersist("mf_meals_custom", false);
   const [showCreate, setShowCreate] = useState(false);
   const [editingMeal, setEditingMeal] = useState(null);
+  const [altFor, setAltFor] = useState(null);       // id de la comida a la que se le agrega otra dentro
+  const [createAltFor, setCreateAltFor] = useState(null);
   const [addFoodOpen, setAddFoodOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -1870,11 +2168,26 @@ function MisComidasTab({ foods, meals, onSaveMeal, onLogMeal, onDelete, onToggle
   const t = cardTheme(theme);
   const bg = BG_STYLES[bgTheme] || BG_STYLES[0];
 
+  // Las comidas que están "dentro" de otra no salen sueltas en la lista:
+  // se ven deslizando la tarjeta de la comida principal hacia la izquierda.
+  const hiddenIds = new Set(meals.flatMap(m => m.alts || []));
+  const topMeals = meals.filter(m => !hiddenIds.has(m.id));
+  const altsOf = (m) => (m.alts || []).map(id => meals.find(x => x.id === id)).filter(Boolean);
+  const toggleAlt = (parentId, altId) => setMeals(l => l.map(m => m.id !== parentId ? m
+    : ({ ...m, alts: (m.alts || []).includes(altId) ? (m.alts || []).filter(x => x !== altId) : [...(m.alts || []), altId] })));
+  const removeAlt = (parentId, altId) => setMeals(l => l.map(m => m.id !== parentId ? m
+    : ({ ...m, alts: (m.alts || []).filter(x => x !== altId) })));
   let filteredMeals = query.trim()
-    ? meals.filter(m => m.name.toLowerCase().includes(query.trim().toLowerCase()))
-    : meals;
-  // Orden alfabético A-Z por defecto
-  filteredMeals = [...filteredMeals].sort((a,b) => a.name.localeCompare(b.name, "es", { sensitivity:"base" }));
+    ? topMeals.filter(m => [m, ...altsOf(m)].some(x => x.name.toLowerCase().includes(query.trim().toLowerCase())))
+    : topMeals;
+  // Sin orden elegido: si el usuario ya acomodó sus comidas (Personalizado)
+  // se respeta su orden; si no, A-Z con las favoritas primero.
+  const mealsDefaultOrder = (list) => [...list]
+    .sort((a,b) => a.name.localeCompare(b.name, "es", { sensitivity:"base" }))
+    .sort((a,b) => (b.favorite?1:0) - (a.favorite?1:0));
+  if (!customOrder) {
+    filteredMeals = [...filteredMeals].sort((a,b) => a.name.localeCompare(b.name, "es", { sensitivity:"base" }));
+  }
   if (sortField) {
     filteredMeals = [...filteredMeals].sort((a,b) => {
       const av = mfComputeMealTotal(a.foods, foods)[sortField];
@@ -1882,8 +2195,10 @@ function MisComidasTab({ foods, meals, onSaveMeal, onLogMeal, onDelete, onToggle
       return sortDir==="asc" ? av-bv : bv-av;
     });
   }
-  // Las marcadas con estrella siempre van primero
-  filteredMeals = [...filteredMeals].sort((a,b) => (b.favorite?1:0) - (a.favorite?1:0));
+  if (!customOrder) {
+    // Las marcadas con estrella van primero (solo en el orden por defecto)
+    filteredMeals = [...filteredMeals].sort((a,b) => (b.favorite?1:0) - (a.favorite?1:0));
+  }
 
   return (
     <SheetLayerCtx.Provider value={bumpSheetLayer}>
@@ -1914,7 +2229,10 @@ function MisComidasTab({ foods, meals, onSaveMeal, onLogMeal, onDelete, onToggle
             placeholder="Buscar comida…"
             style={{ flex:1,padding:"10px 14px",borderRadius:12,border:"1.5px solid #E8EDF5",
               fontSize:14,outline:"none",background:"#F5F6FA",color:"#1E2A3A",boxSizing:"border-box" }}/>
-          <SortButton sortField={sortField} sortDir={sortDir} onChange={(f,d)=>{setSortField(f);setSortDir(d);}}/>
+          <SortButton sortField={sortField} sortDir={sortDir} onChange={(f,d)=>{
+            setSortField(f);setSortDir(d);
+            if (!f && !customOrder) { setMeals(mealsDefaultOrder(meals)); setCustomOrder(true); }
+          }}/>
         </div>
       )}
 
@@ -1934,9 +2252,18 @@ function MisComidasTab({ foods, meals, onSaveMeal, onLogMeal, onDelete, onToggle
             <div style={{ fontWeight:700,fontSize:15,color:false?"#1E2A3A":t.textColor,marginBottom:4 }}>Sin resultados</div>
             <div style={{ fontSize:13,color:false?"#9CA3AF":t.labelColor }}>No encontramos comidas con "{query}"</div>
           </div>
-        ) : filteredMeals.map(meal=>(
-          <MealCard key={meal.id} meal={meal} foods={foods} onLog={onLogMeal} onDelete={onDelete} onEdit={m=>setEditingMeal(m)} onToggleFavorite={onToggleFavorite} theme={theme}/>
-        ))}
+        ) : (
+          <HoldReorderList items={filteredMeals} getKey={m=>m.id}
+            onReorder={keys=>{
+              const base = customOrder ? meals : mealsDefaultOrder(meals);
+              setMeals(mfApplySubsetOrder(base, keys, x=>x.id));
+              setCustomOrder(true); setSortField(null); setSortDir(null);
+            }}
+            renderItem={meal => (
+              <MealCard meal={meal} alts={altsOf(meal)} foods={foods} onLog={onLogMeal} onDelete={onDelete} onEdit={m=>setEditingMeal(m)} onToggleFavorite={onToggleFavorite} theme={theme}
+                onAddAlt={m=>setAltFor(m.id)} onRemoveAlt={removeAlt}/>
+            )}/>
+        )}
       </div>
       </div>
 
@@ -1945,6 +2272,24 @@ function MisComidasTab({ foods, meals, onSaveMeal, onLogMeal, onDelete, onToggle
           theme={theme} bgTheme={bgTheme}
           onSave={m=>{onSaveMeal(m,false);setShowCreate(false);}}
           onClose={()=>setShowCreate(false)}/>
+      )}
+
+      {altFor && !createAltFor && meals.find(m=>m.id===altFor) && (
+        <MealAltPickerSheet parent={meals.find(m=>m.id===altFor)} meals={meals} foods={foods}
+          theme={theme} bgTheme={bgTheme}
+          onToggle={toggleAlt}
+          onCreate={()=>setCreateAltFor(altFor)}
+          onClose={()=>setAltFor(null)}/>
+      )}
+      {createAltFor && (
+        <CreateMealSheet foods={foods}
+          theme={theme} bgTheme={bgTheme}
+          onSave={m=>{
+            const pid = createAltFor;
+            setMeals(l => [...l, m].map(x => x.id===pid ? { ...x, alts:[...(x.alts||[]), m.id] } : x));
+            setCreateAltFor(null);
+          }}
+          onClose={()=>setCreateAltFor(null)}/>
       )}
 
       {editingMeal && (
@@ -2028,7 +2373,7 @@ function MisComidasTab({ foods, meals, onSaveMeal, onLogMeal, onDelete, onToggle
                     </div>
                     <div style={{ flex:1,minWidth:0 }}>
                       <div style={{ fontWeight:700,fontSize:12,color:"#1E2A3A",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap" }}>{food.name}</div>
-                      <div style={{ fontSize:10,color:"#9CA3AF" }}>{food.kcal} kcal (por {food.qty||100}{food.unit||"g"}{food.unit==="p"&&food.gramsPerPiece?` · ${food.gramsPerPiece}g`:""})</div>
+                      <div style={{ fontSize:10,color:"#9CA3AF" }}>{mfRound2(food.kcal)} kcal (por {food.qty||100}{food.unit||"g"}{food.unit==="p"&&food.gramsPerPiece?` · ${food.gramsPerPiece}g`:""})</div>
                     </div>
                   </div>
                 ))}
@@ -2041,10 +2386,10 @@ function MisComidasTab({ foods, meals, onSaveMeal, onLogMeal, onDelete, onToggle
             {(() => {
               const t = mfComputeMealTotal(editingMeal.foods, foods);
               const boxes = [
-                { label:"kcal", v:t.kcal, unit:"",  c:"#4D9DE0", bg:"#EAF2FF" },
-                { label:"Prot", v:t.p,    unit:"g", c:"#F472B6", bg:"#FFEFF5" },
-                { label:"Carb", v:t.c,    unit:"g", c:"#FBBF24", bg:"#FFF8E6" },
-                { label:"Gras", v:t.g,    unit:"g", c:"#4ADE80", bg:"#EDFCF3" },
+                { label:"kcal", v:mfRound2(t.kcal), unit:"",  c:"#4D9DE0", bg:"#EAF2FF" },
+                { label:"Prot", v:mfRound2(t.p),    unit:"g", c:"#F472B6", bg:"#FFEFF5" },
+                { label:"Carb", v:mfRound2(t.c),    unit:"g", c:"#FBBF24", bg:"#FFF8E6" },
+                { label:"Gras", v:mfRound2(t.g),    unit:"g", c:"#4ADE80", bg:"#EDFCF3" },
               ];
               return (
                 <div style={{ display:"flex",gap:6,marginTop:12 }}>
@@ -2115,8 +2460,8 @@ function CreateMealSheet({ foods, onSave, onClose, theme=0, bgTheme=0 }) {
         style={{ width:"100%",padding:"12px 14px",borderRadius:14,border:"1.5px solid rgba(255,255,255,0.18)",fontSize:14,outline:"none",background:"rgba(255,255,255,0.08)",color:cardTheme(theme).textColor,marginBottom:12,boxSizing:"border-box",flexShrink:0 }}/>
       {selectedFoods.length>0 && (
         <div style={{ display:"flex",gap:6,marginBottom:12,flexShrink:0 }}>
-          {[{l:"kcal",v:total.kcal,c:"#4D9DE0",bg:"#EEF3FF"},{l:"Prot",v:`${total.p}g`,c:"#F472B6",bg:"#FFF0F6"},
-            {l:"Carb",v:`${total.c}g`,c:"#FBBF24",bg:"#FFFBEB"},{l:"Gras",v:`${total.g}g`,c:"#4ADE80",bg:"#F0FDF4"}].map(x=>(
+          {[{l:"kcal",v:mfRound2(total.kcal),c:"#4D9DE0",bg:"#EEF3FF"},{l:"Prot",v:`${mfRound2(total.p)}g`,c:"#F472B6",bg:"#FFF0F6"},
+            {l:"Carb",v:`${mfRound2(total.c)}g`,c:"#FBBF24",bg:"#FFFBEB"},{l:"Gras",v:`${mfRound2(total.g)}g`,c:"#4ADE80",bg:"#F0FDF4"}].map(x=>(
             <div key={x.l} style={{ flex:1,background:x.bg,borderRadius:10,padding:"7px 4px",textAlign:"center" }}>
               <div style={{ fontWeight:800,fontSize:12,color:x.c }}>{x.v}</div>
               <div style={{ fontSize:9,color:"#9CA3AF" }}>{x.l}</div>
@@ -2138,7 +2483,7 @@ function CreateMealSheet({ foods, onSave, onClose, theme=0, bgTheme=0 }) {
                 </div>
                 <div style={{ flex:1 }}>
                   <div style={{ fontWeight:700,fontSize:13,color:"#1E2A3A" }}>{food.name}</div>
-                  <div style={{ fontSize:11,color:"#9CA3AF" }}>{food.kcal} kcal · {food.p}g P (por {baseQty}{baseUnit}{baseUnit==="p"&&food.gramsPerPiece?` · ${food.gramsPerPiece}g`:""})</div>
+                  <div style={{ fontSize:11,color:"#9CA3AF" }}>{mfRound2(food.kcal)} kcal · {mfRound2(food.p)}g P (por {baseQty}{baseUnit}{baseUnit==="p"&&food.gramsPerPiece?` · ${food.gramsPerPiece}g`:""})</div>
                 </div>
                 <div style={{ width:22,height:22,borderRadius:6,border:on?"none":"2px solid #D1D5DB",background:on?"#4D9DE0":"#fff",display:"flex",alignItems:"center",justifyContent:"center" }}>
                   {on&&<span style={{ color:"#fff",fontSize:13,fontWeight:700 }}>✓</span>}
@@ -2170,7 +2515,7 @@ function CreateMealSheet({ foods, onSave, onClose, theme=0, bgTheme=0 }) {
   );
 }
 
-function MealCard({ meal, foods, onLog, onDelete, onEdit, onToggleFavorite, theme=0 }) {
+function MealCardPage({ meal, foods, onLog, onDelete, onEdit, onToggleFavorite, theme=0, pageLabel, isAlt=false, onAddAlt, onRemoveAlt }) {
   const [flashing, setFlashing] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [confirmDel, setConfirmDel] = useState(false);
@@ -2189,10 +2534,10 @@ function MealCard({ meal, foods, onLog, onDelete, onEdit, onToggleFavorite, them
   // refleja), y con redondeo solo al final para que sea exacto.
   const total = mfComputeMealTotal(meal.foods, foods);
   const TOTALS = [
-    { key:"kcal", label:"kcal",          v:total.kcal, unit:"",  image:ICONS.calorias, c:"#4D9DE0", bg:"#EAF2FF" },
-    { key:"p",    label:"Proteína",      v:total.p,    unit:"g", image:ICONS.proteina, c:"#F472B6", bg:"#FFEFF5" },
-    { key:"c",    label:"Carbohidratos", v:total.c,    unit:"g", image:ICONS.carbos,   c:"#FBBF24", bg:"#FFF8E6" },
-    { key:"g",    label:"Grasas",        v:total.g,    unit:"g", image:ICONS.grasa,    c:"#4ADE80", bg:"#EDFCF3" },
+    { key:"kcal", label:"kcal",          v:mfRound2(total.kcal), unit:"",  image:ICONS.calorias, c:"#4D9DE0", bg:"#EAF2FF" },
+    { key:"p",    label:"Proteína",      v:mfRound2(total.p),    unit:"g", image:ICONS.proteina, c:"#F472B6", bg:"#FFEFF5" },
+    { key:"c",    label:"Carbohidratos", v:mfRound2(total.c),    unit:"g", image:ICONS.carbos,   c:"#FBBF24", bg:"#FFF8E6" },
+    { key:"g",    label:"Grasas",        v:mfRound2(total.g),    unit:"g", image:ICONS.grasa,    c:"#4ADE80", bg:"#EDFCF3" },
   ];
 
   return (
@@ -2210,6 +2555,8 @@ function MealCard({ meal, foods, onLog, onDelete, onEdit, onToggleFavorite, them
           <CardFlipMenu cardRef={cardRef} onClose={()=>setMenuOpen(false)} t={t}
             options={[
               { icon:"✏️", label:"Editar", onClick:()=>{setMenuOpen(false);onEdit(meal);} },
+              ...(onAddAlt ? [{ icon:"➕", label:"Agregar comida", onClick:()=>{setMenuOpen(false);onAddAlt();} }] : []),
+              ...(isAlt && onRemoveAlt ? [{ icon:"↩️", label:"Quitar de esta comida", onClick:()=>{setMenuOpen(false);onRemoveAlt();} }] : []),
               { icon:"🗑️", label:"Eliminar", danger:true, onClick:()=>{setMenuOpen(false);setConfirmDel(true);} },
             ]}/>
         ) : (
@@ -2221,6 +2568,9 @@ function MealCard({ meal, foods, onLog, onDelete, onEdit, onToggleFavorite, them
               cursor:"pointer",fontSize:19,lineHeight:1,padding:0,zIndex:5,display:"flex",alignItems:"center",justifyContent:"center" }}>
             <span style={{ color: meal.favorite ? "#FBBF24" : t.labelColor }}>{meal.favorite ? "★" : "☆"}</span>
           </button>
+        )}
+        {pageLabel && (
+          <div style={{ fontSize:11,fontWeight:800,letterSpacing:0.4,color:t.labelColor,marginBottom:8,paddingRight:30 }}>{pageLabel}</div>
         )}
         {/* header */}
         <div style={{ display:"flex",alignItems:"center",gap:12,marginBottom:14 }}>
@@ -2276,6 +2626,96 @@ function MealCard({ meal, foods, onLog, onDelete, onEdit, onToggleFavorite, them
     </>
   );
 }
+
+// Una comida puede tener otras comidas "dentro" (alternativas). Se ven
+// deslizando la tarjeta hacia la izquierda; hacia la derecha se vuelve.
+function MealCard({ meal, alts=[], onAddAlt, onRemoveAlt, theme=0, ...rest }) {
+  const pages = [meal, ...alts];
+  const [page, setPage] = useState(0);
+  const [dir, setDir] = useState(1);
+  const touch = useRef(null);
+  const t = cardTheme(theme);
+  const idx = Math.min(page, pages.length - 1);
+  useEffect(() => { if (page > pages.length - 1) setPage(Math.max(0, pages.length - 1)); }, [pages.length]); // eslint-disable-line
+  const cur = pages[idx];
+  const go = (d) => {
+    const np = idx + d;
+    if (np < 0 || np >= pages.length) return;
+    setDir(d); setPage(np);
+  };
+  const onStart = (e) => { const pt = e.touches ? e.touches[0] : e; touch.current = { x: pt.clientX, y: pt.clientY }; };
+  const onEnd = (e) => {
+    if (!touch.current) return;
+    const pt = e.changedTouches ? e.changedTouches[0] : e;
+    const dx = pt.clientX - touch.current.x, dy = pt.clientY - touch.current.y;
+    touch.current = null;
+    if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) go(dx < 0 ? 1 : -1);
+  };
+  return (
+    <div style={{ position:"relative" }}
+      onTouchStart={onStart} onTouchEnd={onEnd} onMouseDown={onStart} onMouseUp={onEnd}>
+      <style>{`@keyframes mfMealL{from{transform:translateX(46px);opacity:0}to{transform:none;opacity:1}}@keyframes mfMealR{from{transform:translateX(-46px);opacity:0}to{transform:none;opacity:1}}`}</style>
+      <div key={cur.id} style={{ animation: pages.length > 1 ? `${dir > 0 ? "mfMealL" : "mfMealR"} 0.25s ease` : undefined }}>
+        <MealCardPage {...rest} meal={cur} theme={theme} isAlt={idx > 0}
+          pageLabel={pages.length > 1 ? (idx === 0 ? `Comida 1 de ${pages.length} · desliza ←` : `Comida ${idx + 1} de ${pages.length}`) : undefined}
+          onAddAlt={onAddAlt ? () => onAddAlt(meal) : undefined}
+          onRemoveAlt={onRemoveAlt ? () => onRemoveAlt(meal.id, cur.id) : undefined}/>
+      </div>
+      {pages.length > 1 && (
+        <div style={{ position:"absolute",left:0,right:0,bottom:-11,display:"flex",justifyContent:"center",gap:5,pointerEvents:"none" }}>
+          {pages.map((_, i) => (
+            <div key={i} style={{ width:i===idx?16:6,height:6,borderRadius:99,transition:"all 0.25s",
+              background:i===idx?"#7C6CF0":"rgba(120,120,120,0.45)" }}/>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Ventana para elegir (o crear) la comida que se mete dentro de otra.
+function MealAltPickerSheet({ parent, meals, foods, onToggle, onCreate, onClose, theme=0, bgTheme=0 }) {
+  const t = cardTheme(theme);
+  const attachedElsewhere = (id) => meals.some(m => m.id !== parent.id && (m.alts || []).includes(id));
+  const candidates = meals.filter(m => m.id !== parent.id && !(m.alts && m.alts.length) && !attachedElsewhere(m.id));
+  const mine = parent.alts || [];
+  return (
+    <Sheet onClose={onClose} maxH="85vh" theme={theme} bgTheme={bgTheme}>
+      <SheetHeader title="➕ Agregar comida" sub={`Dentro de "${parent.name}". Se verá deslizando la tarjeta a la izquierda.`} onClose={onClose} theme={theme}/>
+      <div style={{ flex:1,minHeight:0,overflowY:"auto",marginBottom:12 }}>
+        {candidates.length === 0 && (
+          <div style={{ textAlign:"center",padding:"22px 10px",fontSize:13,color:t.labelColor }}>No tienes otras comidas disponibles. Crea una nueva abajo.</div>
+        )}
+        {candidates.map(m => {
+          const on = mine.includes(m.id);
+          const tot = mfComputeMealTotal(m.foods, foods);
+          return (
+            <button key={m.id} onClick={()=>onToggle(parent.id, m.id)}
+              style={{ width:"100%",display:"flex",alignItems:"center",gap:12,padding:"12px 14px",marginBottom:8,borderRadius:14,cursor:"pointer",textAlign:"left",
+                background:on?"rgba(124,108,240,0.16)":"rgba(120,120,120,0.10)",
+                border:`2px solid ${on?"#7C6CF0":"rgba(120,120,120,0.25)"}` }}>
+              <div style={{ width:26,height:26,borderRadius:8,flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center",
+                background:on?"#7C6CF0":"transparent",border:`2px solid ${on?"#7C6CF0":"rgba(120,120,120,0.5)"}`,color:"#fff",fontSize:16,fontWeight:900 }}>{on?"✓":""}</div>
+              <div style={{ flex:1,minWidth:0 }}>
+                <div style={{ fontWeight:800,fontSize:15,color:t.textColor,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap" }}>{m.name}</div>
+                <div style={{ fontSize:12,color:t.labelColor,marginTop:2 }}>{mfRound2(tot.kcal)} kcal · {m.foods.length} alimento{m.foods.length!==1?"s":""}</div>
+              </div>
+            </button>
+          );
+        })}
+      </div>
+      <button onClick={onCreate}
+        style={{ flexShrink:0,width:"100%",padding:"12px 0",marginBottom:8,borderRadius:14,cursor:"pointer",background:"transparent",
+          border:"2px dashed rgba(124,108,240,0.8)",color:"#7C6CF0",fontSize:14,fontWeight:800 }}>
+        + Crear comida nueva
+      </button>
+      <button onClick={onClose}
+        style={{ flexShrink:0,width:"100%",padding:"14px 0",borderRadius:14,border:"none",cursor:"pointer",background:"#2563EB",color:"#FFFFFF",fontSize:16,fontWeight:800 }}>
+        Listo
+      </button>
+    </Sheet>
+  );
+}
 function SearchModal({ foods, onAdd, onRemove, onClose, theme=0, bgTheme=0 }) {
   const [q, setQ] = useState("");
   const [added, setAdded] = useState({}); // { [food.id]: shopItemUid }
@@ -2313,10 +2753,10 @@ function SearchModal({ foods, onAdd, onRemove, onClose, theme=0, bgTheme=0 }) {
               <div style={{ flex:1 }}>
                 <div style={{ fontWeight:700,fontSize:14,color:"#1E2A3A" }}>{food.name}</div>
                 <div style={{ fontSize:12 }}>
-                  <span style={{ color:"#F472B6",fontWeight:600 }}>{food.kcal} kcal</span>
-                  <span style={{ color:"#CBD5E1" }}> · </span><span style={{ color:"#60A5FA" }}>{food.p}g P</span>
-                  <span style={{ color:"#CBD5E1" }}> · </span><span style={{ color:"#FBBF24" }}>{food.c}g C</span>
-                  <span style={{ color:"#CBD5E1" }}> · </span><span style={{ color:"#4ADE80" }}>{food.g}g G</span>
+                  <span style={{ color:"#F472B6",fontWeight:600 }}>{mfRound2(food.kcal)} kcal</span>
+                  <span style={{ color:"#CBD5E1" }}> · </span><span style={{ color:"#60A5FA" }}>{mfRound2(food.p)}g P</span>
+                  <span style={{ color:"#CBD5E1" }}> · </span><span style={{ color:"#FBBF24" }}>{mfRound2(food.c)}g C</span>
+                  <span style={{ color:"#CBD5E1" }}> · </span><span style={{ color:"#4ADE80" }}>{mfRound2(food.g)}g G</span>
                 </div>
               </div>
               <div style={{ width:36,height:36,borderRadius:"50%",background:isAdded?"#22C55E":"#EEF3FF",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,color:isAdded?"#fff":"#4D9DE0",fontWeight:700,flexShrink:0 }}>
@@ -2751,6 +3191,160 @@ function FatigueModal({ onClose, timestamps, setTimestamps, theme=0, bgTheme=0 }
   );
 }
 
+// ── Notas del gym (hoja de cuaderno con formato por selección) ──
+// El usuario selecciona un pedazo del texto (una palabra, un número, una
+// frase) y le aplica color y/o tamaño SOLO a esa parte, sin tocar el resto
+// de la nota. Por dentro usamos un <div contentEditable> en vez de un
+// <textarea> (un textarea no puede tener partes con distinto estilo) y
+// guardamos el contenido como HTML.
+const NOTE_PEN_COLORS = [
+  { name:"Negro",  hex:"#1E2A3A" },
+  { name:"Azul",   hex:"#2563EB" },
+  { name:"Rojo",   hex:"#DC2626" },
+  { name:"Verde",  hex:"#16A34A" },
+  { name:"Morado", hex:"#7C3AED" },
+];
+const NOTE_FONT_SIZES = [14, 17, 22, 28, 36];
+
+function GymNotesModal({ onClose, theme=0, bgTheme=0 }) {
+  const t = cardTheme(theme);
+  const editorRef = useRef(null);
+  const savedRangeRef = useRef(null);
+
+  const initialHtml = (() => {
+    try {
+      const html = memStorage.getItem("mf_gym_notes_html");
+      if (html) return html;
+      // compatibilidad con notas viejas guardadas como texto plano
+      const old = memStorage.getItem("mf_gym_notes");
+      return old ? old.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/\n/g,"<br>") : "";
+    } catch { return ""; }
+  })();
+
+  useEffect(() => {
+    if (editorRef.current) editorRef.current.innerHTML = initialHtml;
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const saveHtml = () => {
+    try { memStorage.setItem("mf_gym_notes_html", editorRef.current ? editorRef.current.innerHTML : ""); } catch {}
+  };
+
+  // Guarda en qué parte del texto estaba el cursor/selección ANTES de que
+  // el dedo/mouse toque un botón de la barra de herramientas (tocar un
+  // botón le quita el foco al editor y se perdería la selección si no la
+  // guardáramos a mano).
+  const keepSelection = () => {
+    const sel = window.getSelection();
+    if (sel && sel.rangeCount > 0 && editorRef.current && editorRef.current.contains(sel.anchorNode)) {
+      savedRangeRef.current = sel.getRangeAt(0).cloneRange();
+    }
+  };
+  const restoreSelection = () => {
+    const sel = window.getSelection();
+    if (sel && savedRangeRef.current) {
+      sel.removeAllRanges();
+      sel.addRange(savedRangeRef.current);
+    }
+  };
+
+  const applyColor = (hex) => {
+    if (!editorRef.current) return;
+    editorRef.current.focus();
+    restoreSelection();
+    document.execCommand("styleWithCSS", false, true);
+    document.execCommand("foreColor", false, hex);
+    saveHtml();
+  };
+
+  const applyFontSize = (px) => {
+    const editor = editorRef.current;
+    if (!editor) return;
+    editor.focus();
+    restoreSelection();
+    // Importante: el color deja activado el modo "CSS", y en ese modo el
+    // navegador NO crea <font size=7> sino otro tipo de etiqueta. Lo
+    // apagamos para que el tamaño siempre se aplique igual.
+    document.execCommand("styleWithCSS", false, false);
+    document.execCommand("fontSize", false, "7");
+    // execCommand solo acepta tamaños 1-7 (no px): usamos el 7 como
+    // marcador y lo cambiamos por un <span> con el tamaño real elegido.
+    // Así se puede volver a cambiar el tamaño las veces que quieras
+    // (grande -> chico -> mediano), porque el nuevo tamaño queda "adentro"
+    // y tiene prioridad sobre el anterior.
+    const made = [];
+    editor.querySelectorAll('font[size="7"], span[style*="xxx-large"], span[style*="-webkit-xxx-large"]').forEach(f => {
+      const span = document.createElement("span");
+      span.style.fontSize = px + "px";
+      while (f.firstChild) span.appendChild(f.firstChild);
+      f.replaceWith(span);
+      made.push(span);
+    });
+    // Mantiene seleccionado el texto para poder seguir cambiándolo
+    if (made.length) {
+      const sel = window.getSelection();
+      const r = document.createRange();
+      r.setStartBefore(made[0]);
+      r.setEndAfter(made[made.length - 1]);
+      sel.removeAllRanges();
+      sel.addRange(r);
+      savedRangeRef.current = r.cloneRange();
+    }
+    saveHtml();
+  };
+
+  return (
+    <Sheet onClose={onClose} maxH="92vh" theme={theme} bgTheme={bgTheme}>
+      <SheetHeader title="📝 Notas" sub="Selecciona una palabra o frase y toca un color o tamaño: se aplica solo a esa parte." onClose={onClose} theme={theme}/>
+
+      {/* Opciones: color y tamaño, aplicados a lo que tengas seleccionado */}
+      <div style={{ display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,marginBottom:14,flexShrink:0,flexWrap:"wrap" }}>
+        <div style={{ display:"flex",gap:8,alignItems:"center" }}>
+          {NOTE_PEN_COLORS.map(c => (
+            <button key={c.hex}
+              onMouseDown={e=>{ e.preventDefault(); keepSelection(); }}
+              onTouchStart={keepSelection}
+              onClick={()=>applyColor(c.hex)} aria-label={c.name}
+              style={{ width:26,height:26,borderRadius:"50%",background:c.hex,cursor:"pointer",
+                border:"2px solid rgba(120,120,120,0.15)",boxSizing:"border-box",padding:0 }}/>
+          ))}
+        </div>
+        <div style={{ display:"flex",alignItems:"center",gap:5,background:"rgba(120,120,120,0.12)",borderRadius:12,padding:"4px 6px" }}>
+          {NOTE_FONT_SIZES.map((px, i) => (
+            <button key={px}
+              onMouseDown={e=>{ e.preventDefault(); keepSelection(); }}
+              onTouchStart={keepSelection}
+              onClick={()=>applyFontSize(px)}
+              style={{ width:26,height:26,borderRadius:8,border:"none",cursor:"pointer",fontWeight:700,
+                fontSize:12+i*2,background:"rgba(120,120,120,0.18)",color:t.textColor,
+                display:"flex",alignItems:"center",justifyContent:"center" }}>A</button>
+          ))}
+        </div>
+      </div>
+
+      {/* Hoja de cuaderno */}
+      <div style={{ flex:1,minHeight:0,borderRadius:14,overflow:"auto",background:"#FFFDF6",
+        boxShadow:"inset 0 0 0 1px rgba(0,0,0,0.06)",position:"relative" }}>
+        {/* margen rojo estilo cuaderno */}
+        <div style={{ position:"absolute",top:0,bottom:0,left:34,width:1,background:"rgba(220,38,38,0.35)" }}/>
+        <div ref={editorRef} contentEditable suppressContentEditableWarning
+          onInput={saveHtml} onBlur={saveHtml} onMouseUp={keepSelection} onKeyUp={keepSelection}
+          data-placeholder="Escribe tu nota aquí..."
+          style={{ width:"100%",minHeight:300,outline:"none",
+            padding:"10px 14px 20px 44px",boxSizing:"border-box",
+            fontFamily:"Arial, Helvetica, sans-serif",
+            fontSize:17, lineHeight:"30px", color:"#1E2A3A" }}/>
+      </div>
+      <button onClick={()=>{ saveHtml(); onClose(); }}
+        style={{ flexShrink:0,marginTop:12,width:"100%",padding:"14px 0",borderRadius:14,border:"none",cursor:"pointer",
+          background:"#2563EB",color:"#FFFFFF",fontSize:16,fontWeight:800,
+          boxShadow:"0 2px 8px rgba(37,99,235,0.35)" }}>
+        Listo
+      </button>
+      <style>{`[contenteditable]:empty:before{content:attr(data-placeholder);color:#9CA3AF;}`}</style>
+    </Sheet>
+  );
+}
+
 // ── Calorie gauge ─────────────────────────────────────────────
 function CalorieGauge({ consumed, goal }) {
   const pct=Math.min(consumed/goal,1), r=90, cx=120, cy=110;
@@ -2838,7 +3432,7 @@ function MacroRow({ emoji, image, label, color, value, goal, onAdd, theme=0, bar
         <div style={{ flex:1,minWidth:0 }}>
           <div style={{ fontWeight:700,fontSize:12,color:false?hex:theme===3?accent:"#fff",letterSpacing:0.5,textTransform:"uppercase" }}>{label}</div>
           <div style={{ fontWeight:800,fontSize:20,color:valueColor,lineHeight:1 }}>{mfRound2(value)}<span style={{ fontSize:13,fontWeight:500,color:subColor }}> g</span></div>
-          <div style={{ fontSize:11,color:subColor }}>{Math.round(pct*100)}% / {goal}g</div>
+          <div style={{ fontSize:11,color:subColor }}>{Math.round(pct*100)}% / {mfRound2(goal)}g</div>
         </div>
         <button onClick={onAdd} style={{ width:36,height:36,borderRadius:10,background:badge.background,border:"none",cursor:"pointer",fontSize:20,color:false?hex:(accent||"#fff"),display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700,flexShrink:0 }}><img src={ICONS.masVerde} alt="+" style={{width:18,height:18,objectFit:"contain",filter:"none"}}/></button>
       </div>
@@ -3172,9 +3766,10 @@ function PhotoCard({ p, theme, onView, onEdit, onDelete }) {
       <>
       {/* photo */}
       {p.src
-        ? <img src={p.src} alt="" onClick={onView}
-            style={{ width:"100%",height:220,objectFit:"cover",display:"block",cursor:"pointer" }}/>
-        : <div style={{ width:"100%",height:220,background:"rgba(255,255,255,0.06)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:40 }}>📷</div>}
+        ? <div onClick={onView} style={{ width:"100%",height:400,background:"rgba(255,255,255,0.06)",display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer" }}>
+            <img src={p.src} alt="" style={{ width:"100%",height:"100%",objectFit:"contain",display:"block" }}/>
+          </div>
+        : <div style={{ width:"100%",height:400,background:"rgba(255,255,255,0.06)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:40 }}>📷</div>}
       {/* 3-dot menu button */}
       <button onClick={e=>{e.stopPropagation(); if(cardRef.current) setLockedH(cardRef.current.offsetHeight); setMenuOpen(true);}}
         style={{ position:"absolute",top:10,right:10,width:32,height:32,borderRadius:"50%",background:"rgba(255,255,255,0.9)",border:"none",
@@ -3658,7 +4253,7 @@ function PhotosScreen({ photos, onAdd, onUpdate, onDelete, onClose, theme=0, bgT
               style={{ width:"100%",height:180,borderRadius:16,background:"rgba(255,255,255,0.06)",border:`2px dashed ${t.labelColor}`,
                 display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",overflow:"hidden",marginBottom:14 }}>
               {form.src
-                ? <img src={form.src} alt="" style={{ width:"100%",height:"100%",objectFit:"cover" }}/>
+                ? <img src={form.src} alt="" style={{ width:"100%",height:"100%",objectFit:"contain" }}/>
                 : <div style={{ textAlign:"center" }}>
                     <div style={{ fontSize:36,marginBottom:10 }}>📷</div>
                     <div style={{ background:accent==="#fff"?"#1E2A3A":accent,color:"#fff",borderRadius:12,padding:"8px 20px",
@@ -4184,21 +4779,36 @@ function SeguimientoTab({ kcal, macros, water, goals, onShowPhotos, onShowProfil
               <button onClick={()=>setActivityMenuOpen(o=>!o)}
                 style={{ background:"none",border:"none",cursor:"pointer",fontSize:fscale(box,20,16),color:t.labelColor,padding:"0 2px" }}>⋮</button>
             </div>
-            <div style={{ display:"flex",alignItems:"center",gap:dense?10:14,flex:1 }}>
+            <div style={{ display:"flex",alignItems:"center",gap:dense?10:16,flex:1,minHeight:0 }}>
               <img src={ICONS.appLogo} alt=""
-                style={{ width:fscale(box,74,44),height:fscale(box,74,44),objectFit:"contain",flexShrink:0,
-                  filter: isToday ? "none" : "grayscale(1) opacity(0.4)" }}/>
-              <div style={{ flex:1,minWidth:0 }}>
-                {isToday ? (
-                  <>
-                    <div style={{ fontSize:fscale(box,11,9),fontWeight:800,color:"#22C55E",letterSpacing:0.4 }}>COMPLETADO</div>
-                    <div style={{ fontSize:fscale(box,16,12),fontWeight:900,color:routineColor,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis" }}>{latest.routineName}</div>
-                    <div style={{ fontSize:fscale(box,12,10),color:t.labelColor,marginTop:2 }}>{latest.exercisesCompleted} ejercicios</div>
-                    <div style={{ fontSize:fscale(box,12,10),color:t.labelColor,fontWeight:700 }}>{mfFormatWorkoutDuration(latest.durationMs)}</div>
-                  </>
-                ) : (
-                  <div style={{ fontSize:fscale(box,13,11),color:t.labelColor }}>Sin actividad todavía</div>
-                )}
+                style={{ width:fscale(box,118,62),height:fscale(box,118,62),objectFit:"contain",flexShrink:0,
+                  transition:"filter 0.4s",
+                  filter: isToday ? `drop-shadow(0 0 10px ${routineColor}) drop-shadow(0 0 22px ${routineColor}aa) brightness(1.08)` : "grayscale(1) opacity(0.4)" }}/>
+              <div style={{ flex:1,minWidth:0,display:"flex",flexDirection:"column",justifyContent:"center",gap:fscale(box,6,3) }}>
+                {(() => {
+                  const dash = "----";
+                  const two = n => String(n).padStart(2,"0");
+                  const hm = ms => new Date(ms).toLocaleTimeString("es", { hour:"2-digit", minute:"2-digit" });
+                  const rows = isToday ? [
+                    ["Rutina", latest.routineName || dash],
+                    ["Plan de entrenamiento", latest.planName || dash],
+                    ["Inicio", latest.startedAt ? hm(latest.startedAt) : dash],
+                    ["Fin", hm(latest.finishedAt)],
+                    ["Tiempo total", mfFormatWorkoutDuration(latest.durationMs)],
+                    ["Fecha", new Date(latest.finishedAt).toLocaleDateString("es", { day:"2-digit", month:"2-digit", year:"numeric" })],
+                    ["Ejercicios", `${two(latest.exercisesCompleted||0)} de ${two(latest.exercisesTotal||0)}`],
+                  ] : [
+                    ["Rutina", dash], ["Plan de entrenamiento", dash], ["Inicio", dash], ["Fin", dash],
+                    ["Tiempo total", dash], ["Fecha", dash], ["Ejercicios", "00 de 00"],
+                  ];
+                  return rows.map(([label, val], i) => (
+                    <div key={label} style={{ display:"flex",alignItems:"baseline",gap:6,minWidth:0,lineHeight:1.15 }}>
+                      <span style={{ fontSize:fscale(box,11.5,9),color:t.labelColor,flexShrink:0 }}>{label}:</span>
+                      <span style={{ fontSize:fscale(box,13.5,10.5),fontWeight:800,minWidth:0,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis",
+                        color: (isToday && i===0) ? routineColor : t.textColor }}>{val}</span>
+                    </div>
+                  ));
+                })()}
               </div>
             </div>
             {activityMenuOpen && (
@@ -4395,6 +5005,7 @@ function ExerciseScreen({ dayKey, entry, routineId, routineName, routineEmoji, s
     setSession({
       routineId, routineName, entryId: dayKey,
       startedAt: Date.now(), checked: {}, totalExercises: exercises.length,
+      planName: Array.isArray(entry?.muscles) ? entry.muscles.join(", ") : (entry?.muscles || ""),
     });
   };
   const finishWorkout = () => {
@@ -4402,7 +5013,7 @@ function ExerciseScreen({ dayKey, entry, routineId, routineName, routineEmoji, s
     const completedCount = Object.values(session.checked||{}).filter(Boolean).length;
     setHistory(h => [...h, {
       id: Date.now(),
-      routineId: session.routineId, routineName: session.routineName,
+      routineId: session.routineId, routineName: session.routineName, planName: session.planName || "",
       startedAt: session.startedAt, finishedAt: Date.now(),
       durationMs: Date.now()-session.startedAt,
       exercisesCompleted: completedCount, exercisesTotal: session.totalExercises,
@@ -4528,7 +5139,16 @@ function ExerciseScreen({ dayKey, entry, routineId, routineName, routineEmoji, s
             <div style={{ fontWeight:700,fontSize:15,color:t.textColor,marginBottom:6 }}>Sin ejercicios aún</div>
             <div style={{ fontSize:13,color:t.labelColor }}>Toca 🏋️ o + para añadir tu primer ejercicio</div>
           </div>
-        ) : exercises.map((ex, i) => {
+        ) : (
+          <HoldReorderList items={blocks} getKey={b => (exercises[b[0]]?.id ?? ("i"+b[0]))}
+            onReorder={keys => {
+              const byKey = new Map(blocks.map(b => [(exercises[b[0]]?.id ?? ("i"+b[0])), b]));
+              const newList = [];
+              keys.forEach(k => byKey.get(k).forEach(idx => newList.push(exercises[idx])));
+              commit(newList);
+            }}
+            renderItem={block => block.map(i => {
+          const ex = exercises[i];
           const sdata = mfGetSeriesData(ex);
           const repsDisplay = mfCombineSeriesValues(sdata.map(s=>s.reps), "");
           const weightDisplay = ex.weightType==="polea"
@@ -4556,8 +5176,6 @@ function ExerciseScreen({ dayKey, entry, routineId, routineName, routineEmoji, s
                   <CardFlipMenu cardRef={{current:exCardRefs.current[i]}} onClose={()=>setMenuIdx(null)} t={t}
                     options={[
                       { icon:"🎯", label:"Objetivo", onClick:()=>{setMenuIdx(null);setEditIdx(i);setShowAdd(true);} },
-                      ...(blockIndexOf(i) > 0 ? [{ icon:"⬆️", label:"Subir", onClick:()=>{setMenuIdx(null);moveBlock(i,-1);} }] : []),
-                      ...(blockIndexOf(i) < blocks.length-1 ? [{ icon:"⬇️", label:"Bajar", onClick:()=>{setMenuIdx(null);moveBlock(i,1);} }] : []),
                       ...(isPartOfSuperset(i) ? [{ icon:"🔗", label:"Excluir superserie", color:"#F97316", onClick:()=>{setMenuIdx(null);toggleSuperset(i);} }]
                         : i < exercises.length-1 ? [{ icon:"🔗", label:"Superserie", color:"#F97316", onClick:()=>{setMenuIdx(null);toggleSuperset(i);} }] : []),
                       { icon:"🚫", label:"Excluir del plan", danger:true, onClick:()=>{setMenuIdx(null);setExcludeIdx(i);} },
@@ -4625,7 +5243,8 @@ function ExerciseScreen({ dayKey, entry, routineId, routineName, routineEmoji, s
             )}
             </React.Fragment>
           );
-        })}
+        })}/>
+        )}
       </div>
       </div>
 
@@ -5928,8 +6547,18 @@ function ExercisesLibraryScreen({ exercises: initialExercises, onBack, onUpdateE
           </div>
         ) : (
           <div style={{ display:"grid",gridTemplateColumns:"minmax(0,1fr) minmax(0,1fr)",gap:10 }}>
-            {filtered.map(({ex,i}) => (
-              <div key={ex.id||i} ref={el=>{exGridRefs.current[i]=el;}} onClick={()=>{ if(menuIdx===null) setDetailEx({idx:i,data:ex}); }}
+            <HoldReorderList grid items={filtered} getKey={({ex,i}) => (ex.id ?? ("i"+i))}
+              onReorder={keys => {
+                const idOf = (e,i) => (e.id ?? ("i"+i));
+                const byKey = new Map(exercises.map((e,i) => [idOf(e,i), e]));
+                const visible = new Set(filtered.map(({ex,i}) => idOf(ex,i)));
+                let n = 0;
+                const updated = exercises.map((e,i) => visible.has(idOf(e,i)) ? byKey.get(keys[n++]) : e);
+                setExercises(updated);
+                if (onUpdateExercises) onUpdateExercises(updated);
+              }}
+              renderItem={({ex,i}) => (
+              <div ref={el=>{exGridRefs.current[i]=el;}} onClick={()=>{ if(menuIdx===null) setDetailEx({idx:i,data:ex}); }}
                 style={{ background:false?"#fff":t.bg,...glassProps(t),borderRadius:16,overflow:"visible",cursor:"pointer",
                   boxShadow:false?"0 1px 6px rgba(0,0,0,0.06)":"none",position:"relative",
                   minHeight: menuIdx===i ? menuLockedH : undefined }}>
@@ -5970,7 +6599,7 @@ function ExercisesLibraryScreen({ exercises: initialExercises, onBack, onUpdateE
                 </>
                 )}
               </div>
-            ))}
+            )}/>
           </div>
         )}
       </div>
@@ -6001,6 +6630,7 @@ function GymTab({ routines, setRoutines, fatigueTimestamps, setFatigueTimestamps
   const [planRoutine,  setPlanRoutine] = useState(null);
   const [libraryCtx,   setLibraryCtx]  = useState(null);
   const [showFatigue,  setShowFatigue] = useState(false);
+  const [showNotes,    setShowNotes]   = useState(false);
   const [deleteRoutineCtx, setDeleteRoutineCtx] = useState(null);
   const [mapGender,    setMapGender]   = useState("male");
   const [mapView,      setMapView]     = useState("front");
@@ -6111,11 +6741,18 @@ function GymTab({ routines, setRoutines, fatigueTimestamps, setFatigueTimestamps
           </div>
           <div style={{ fontSize:26,fontWeight:900,color:bgH.light?"#fff":"#1E2A3A",letterSpacing:-0.5 }}>MACROSFIT</div>
         </div>
-        <button onClick={()=>setShowFatigue(true)}
-          style={{ width:42,height:42,borderRadius:13,background:bgH.light?"rgba(255,255,255,0.22)":"#FFFBEB",border:"none",cursor:"pointer",
-            fontSize:22,display:"flex",alignItems:"center",justifyContent:"center" }}>
-          <img src={ICONS.fatiga} alt="Fatiga muscular" style={{ width:26,height:26,objectFit:"contain",filter:"none" }}/>
-        </button>
+        <div style={{ display:"flex",gap:8 }}>
+          <button onClick={()=>setShowNotes(true)}
+            style={{ width:42,height:42,borderRadius:13,background:bgH.light?"rgba(255,255,255,0.22)":"#EEF3FF",border:"none",cursor:"pointer",
+              fontSize:22,display:"flex",alignItems:"center",justifyContent:"center" }}>
+            📝
+          </button>
+          <button onClick={()=>setShowFatigue(true)}
+            style={{ width:42,height:42,borderRadius:13,background:bgH.light?"rgba(255,255,255,0.22)":"#FFFBEB",border:"none",cursor:"pointer",
+              fontSize:22,display:"flex",alignItems:"center",justifyContent:"center" }}>
+            <img src={ICONS.fatiga} alt="Fatiga muscular" style={{ width:26,height:26,objectFit:"contain",filter:"none" }}/>
+          </button>
+        </div>
       </div>
 
       <div style={{ padding:"14px 14px" }}>
@@ -6249,6 +6886,9 @@ function GymTab({ routines, setRoutines, fatigueTimestamps, setFatigueTimestamps
       )}
       {showFatigue && (
         <FatigueModal onClose={()=>setShowFatigue(false)} timestamps={fatigueTimestamps} setTimestamps={setFatigueTimestamps} theme={rutinasTheme} bgTheme={bgTheme}/>
+      )}
+      {showNotes && (
+        <GymNotesModal onClose={()=>setShowNotes(false)} theme={rutinasTheme} bgTheme={bgTheme}/>
       )}
       {deleteRoutineCtx && (
         <ConfirmSheet message={`¿Eliminar "${deleteRoutineCtx.data.name}"?`} theme={deleteRoutineCtx.theme} bgTheme={deleteRoutineCtx.bgTheme}
@@ -6423,7 +7063,7 @@ function defaultBoxes(ids, containerW) {
   const gap = 10;
   const boxes = {};
   let y = 0;
-  ids.forEach(id => { boxes[id] = { x:0, y, w:containerW, h:190 }; y += 190+gap; });
+  ids.forEach(id => { const hh = id==="actividad" ? 290 : 190; boxes[id] = { x:0, y, w:containerW, h:hh }; y += hh+gap; });
   return boxes;
 }
 
@@ -6437,7 +7077,7 @@ function useFreeformLayout(storageKey, ids, containerW) {
       let themes = { ...(l.themes||{}) };
       const maxY = () => Object.values(boxes).reduce((m,b)=>Math.max(m,b.y+b.h),0);
       ids.forEach(id => {
-        if (!boxes[id]) { boxes[id] = { x:0, y:maxY()+10, w:containerW, h:190 }; changed = true; }
+        if (!boxes[id]) { boxes[id] = { x:0, y:maxY()+10, w:containerW, h:(id==="actividad"?290:190) }; changed = true; }
         if (themes[id]===undefined) { themes[id] = 0; changed = true; }
       });
       Object.keys(boxes).forEach(id => { if (!ids.includes(id)) { delete boxes[id]; changed = true; } });
@@ -6448,7 +7088,19 @@ function useFreeformLayout(storageKey, ids, containerW) {
         const x = Math.max(0, Math.min(b.x, containerW - w));
         if (w !== b.w || x !== b.x) { boxes[id] = { ...b, w, x }; changed = true; }
       });
-      return changed ? { boxes, themes } : l;
+      // Una sola vez: la tarjeta "Actividad de hoy" ahora es más grande
+      // (empuja hacia abajo las tarjetas que tenga debajo).
+      let flag = l.mAct2;
+      if (!flag && boxes.actividad) {
+        const b = boxes.actividad, target = 290;
+        if (b.h < target) {
+          const delta = target - b.h, oldBottom = b.y + b.h;
+          Object.keys(boxes).forEach(k => { if (k !== "actividad" && boxes[k].y >= oldBottom - 1) boxes[k] = { ...boxes[k], y: boxes[k].y + delta }; });
+          boxes.actividad = { ...b, h: target };
+        }
+        flag = true; changed = true;
+      }
+      return changed ? { ...l, boxes, themes, mAct2: flag } : l;
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ids.join("|"), containerW]);
@@ -6712,6 +7364,7 @@ function MacrosFitApp() {
   const [editingFood, setEditingFood] = useState(null);
   const [alimentosSearchOpen, setAlimentosSearchOpen] = useState(false);
   const [alimentosQuery, setAlimentosQuery] = useState("");
+  const [alimentosCustom, setAlimentosCustom] = usePersist("mf_foods_custom", false);
   const [alimentosSortField, setAlimentosSortField] = useState(null);
   const [alimentosSortDir, setAlimentosSortDir] = useState(null);
   const [macroInput,  setMacroInput]  = useState(null);
@@ -6797,6 +7450,7 @@ function MacrosFitApp() {
           try { vitamins = JSON.parse(memStorage.getItem("mf_vitamins") || "[]"); } catch {}
           let changed = false;
           vitamins = vitamins.map(v => {
+            if (v.active===false) return v;
             const dayOk = !v.days || v.days.length===0 || v.days.includes(now.getDay());
             if (dayOk && v.alarm && v.alarm===hhmm && v.lastFired!==fireStamp && v.takenDate!==todayStr) {
               mfSendReminder(vMode, "💊 Hora de tu vitamina", `${v.name} — ${v.pills} pastilla${v.pills!=1?"s":""} (${v.mg} mg)`);
@@ -7028,7 +7682,7 @@ function MacrosFitApp() {
               render:(box,theme)=>{
                 const t = cardTheme(theme);
                 const pct = goals.kcal ? Math.min(kcal/goals.kcal,1) : 0;
-                const remain = goals.kcal-kcal;
+                const remain = mfRound2(goals.kcal-kcal);
                 return (
                   <div ref={kcalCardRef} style={{ background:t.bg,borderRadius:t.radius,boxShadow:t.shadow,border:t.border,...glassProps(t),
                     padding:"16px 18px",position:"relative",overflow:"visible",height:"100%",boxSizing:"border-box",
@@ -7070,7 +7724,7 @@ function MacrosFitApp() {
                       )}
                       <div style={{ textAlign:"center",marginTop:false?-18:0 }}>
                         <div style={{ fontSize:fscale(box,false?52:40,26),fontWeight:t.weight,color:theme===3?t.accent:t.textColor,lineHeight:1 }}>{mfRound2(kcal)}</div>
-                        <div style={{ fontSize:fscale(box,13,10),color:t.labelColor,marginTop:3,textTransform:t.case }}>de {goals.kcal} kcal</div>
+                        <div style={{ fontSize:fscale(box,13,10),color:t.labelColor,marginTop:3,textTransform:t.case }}>de {mfRound2(goals.kcal)} kcal</div>
                         <div style={{ fontSize:fscale(box,15,11),fontWeight:700,color:false?"#4D9DE0":t.textColor,marginTop:6,opacity:false?1:0.92 }}>
                           {remain} kcal restantes
                         </div>
@@ -7175,7 +7829,11 @@ function MacrosFitApp() {
                 style={{ flex:1,padding:"10px 14px",borderRadius:12,border:"1.5px solid #E8EDF5",
                   fontSize:14,outline:"none",background:"#F5F6FA",color:"#1E2A3A",boxSizing:"border-box" }}/>
               <SortButton sortField={alimentosSortField} sortDir={alimentosSortDir}
-                onChange={(f,d)=>{setAlimentosSortField(f);setAlimentosSortDir(d);}}/>
+                onChange={(f,d)=>{
+                  setAlimentosSortField(f);setAlimentosSortDir(d);
+                  // "Personalizado": la primera vez fija el orden actual (A-Z) como punto de partida
+                  if (!f && !alimentosCustom) { setFoods(mfFoodsDefaultOrder(foods)); setAlimentosCustom(true); }
+                }}/>
             </div>
           )}
 
@@ -7185,14 +7843,19 @@ function MacrosFitApp() {
               let list = alimentosQuery.trim()
                 ? foods.filter(f => f.name.toLowerCase().includes(alimentosQuery.trim().toLowerCase()))
                 : foods;
-              // Orden alfabético A-Z por defecto
-              list = [...list].sort((a,b) => a.name.localeCompare(b.name, "es", { sensitivity:"base" }));
+              // Sin orden elegido: si el usuario ya acomodó su lista (Personalizado)
+              // se respeta tal cual; si no, A-Z con favoritos primero.
+              if (!alimentosCustom) {
+                list = [...list].sort((a,b) => a.name.localeCompare(b.name, "es", { sensitivity:"base" }));
+              }
               if (alimentosSortField) {
                 list = [...list].sort((a,b) =>
                   alimentosSortDir==="asc" ? a[alimentosSortField]-b[alimentosSortField] : b[alimentosSortField]-a[alimentosSortField]);
               }
-              // Los marcados con estrella siempre van primero
-              list = [...list].sort((a,b) => (b.favorite?1:0) - (a.favorite?1:0));
+              if (!alimentosCustom) {
+                // Los marcados con estrella van primero (solo en el orden por defecto)
+                list = [...list].sort((a,b) => (b.favorite?1:0) - (a.favorite?1:0));
+              }
               if (list.length===0) return (
                 <div style={{ textAlign:"center",padding:"50px 20px" }}>
                   <div style={{ fontSize:40,marginBottom:12 }}><img src={ICONS.lupa} alt="" style={{width:40,height:40,objectFit:"contain",margin:"0 auto"}}/></div>
@@ -7200,20 +7863,28 @@ function MacrosFitApp() {
                   <div style={{ fontSize:13,color:"#9CA3AF" }}>No encontramos alimentos con "{alimentosQuery}"</div>
                 </div>
               );
-              return list.map(food => (
-                <div key={food.id} style={{ marginBottom:10 }}>
-                  <FoodListCard
-                    food={food}
-                    expanded={expandedFoodId===food.id}
-                    onToggle={()=>setExpandedFoodId(id=>id===food.id?null:food.id)}
-                    onLog={logFood}
-                    onEdit={f=>{setEditingFood(f);setModal("addFood");}}
-                    onDelete={deleteFood}
-                    onToggleFavorite={id=>setFoods(l=>l.map(x=>x.id===id?{...x,favorite:!x.favorite}:x))}
-                    theme={kcalTheme}
-                  />
-                </div>
-              ));
+              return (
+                <HoldReorderList items={list} getKey={f=>f.id}
+                  onReorder={keys=>{
+                    const base = alimentosCustom ? foods : mfFoodsDefaultOrder(foods);
+                    setFoods(mfApplySubsetOrder(base, keys, x=>x.id));
+                    setAlimentosCustom(true); setAlimentosSortField(null); setAlimentosSortDir(null);
+                  }}
+                  renderItem={food => (
+                    <div style={{ marginBottom:10 }}>
+                      <FoodListCard
+                        food={food}
+                        expanded={expandedFoodId===food.id}
+                        onToggle={()=>setExpandedFoodId(id=>id===food.id?null:food.id)}
+                        onLog={logFood}
+                        onEdit={f=>{setEditingFood(f);setModal("addFood");}}
+                        onDelete={deleteFood}
+                        onToggleFavorite={id=>setFoods(l=>l.map(x=>x.id===id?{...x,favorite:!x.favorite}:x))}
+                        theme={kcalTheme}
+                      />
+                    </div>
+                  )}/>
+              );
             })()}
           </div>
           </div>
@@ -7248,9 +7919,11 @@ function MacrosFitApp() {
                 <div style={{ fontSize:12,color: false?"#9CA3AF":cardTheme(kcalTheme).labelColor }}>Desliza hacia la izquierda para eliminar</div>
               </div>
             </div>
-            {shopList.map(item=>(
-              <ShopItem key={item.id} item={item} onToggle={toggleShop} onQtyChange={changeQty} onUnitChange={changeUnit} onDelete={deleteShop} theme={kcalTheme} bgTheme={bgIngesta}/>
-            ))}
+            <HoldReorderList items={shopList} getKey={i=>i.id}
+              onReorder={keys=>setShopList(l=>mfApplySubsetOrder(l, keys, x=>x.id))}
+              renderItem={item => (
+                <ShopItem item={item} onToggle={toggleShop} onQtyChange={changeQty} onUnitChange={changeUnit} onDelete={deleteShop} theme={kcalTheme} bgTheme={bgIngesta}/>
+              )}/>
             <button onClick={()=>setShopList(l=>l.map(i=>({...i,checked:false})))}
               style={{ width:"100%",background: false?"#fff":cardTheme(kcalTheme).bg,...glassProps(cardTheme(kcalTheme)),border:"none",borderRadius:16,padding:"14px 0",cursor:"pointer",color:"#A78BFA",fontWeight:600,fontSize:14,marginTop:4,boxShadow: false?"0 1px 4px rgba(0,0,0,0.05)":"none" }}>
               ☰ Limpiar marcas
@@ -7279,7 +7952,7 @@ function MacrosFitApp() {
       {/* ── MIS COMIDAS (página completa) ── */}
       {tab==="misComidas" && (
         <MisComidasTab
-          foods={foods} meals={meals}
+          foods={foods} meals={meals} setMeals={setMeals}
           theme={kcalTheme} bgTheme={bgIngesta}
           onSaveMeal={(m, isEdit)=>{
             if (isEdit) setMeals(l=>l.map(x=>x.id===m.id?m:x));
